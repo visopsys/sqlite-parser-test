@@ -996,7 +996,7 @@ fn parseColumnConstraint(p: *Parse) Error!?Node.Index {
 fn parseKeywordConstraint(p: *Parse) Error!void {
     const first = p.peek();
     if (first == .keyword_references) return p.parseReferences(false);
-    if (first == .keyword_deferrable or p.token_tags[p.tok_i + 1] == .keyword_deferrable) return p.parseDeferClause();
+    if (first == .keyword_deferrable or (first == .keyword_not and p.token_tags[p.tok_i + 1] == .keyword_deferrable)) return p.parseDeferClause();
     _ = p.nextToken();
     if (first == .keyword_primary) {
         if (!p.eat(.keyword_key)) return p.failHere();

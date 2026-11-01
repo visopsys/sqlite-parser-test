@@ -36,6 +36,18 @@ fn isNondeterministic(arena: std.mem.Allocator, sql: []const u8) !bool {
     }
 }
 
+/// Whether `sql` is a SELECT without clauses, subqueries or windows: just expressions.
+fn isConstantSelect(arena: std.mem.Allocator, sql: []const u8) !bool {
+    const source = try arena.dupeSentinel(u8, sql, 0);
+    var t: sqlite_parser.tokenizer.Tokenizer = .init(source);
+    if (t.next().tag != .keyword_select) return false;
+    while (true) switch (t.next().tag) {
+        .eof => return true,
+        .keyword_with, .keyword_over, .keyword_filter, .keyword_window, .keyword_from, .keyword_where, .keyword_group, .keyword_having, .keyword_order, .keyword_limit, .keyword_union, .keyword_intersect, .keyword_except, .keyword_values, .keyword_select, .keyword_exists, .keyword_in => return false,
+        else => {},
+    };
+}
+
 const Comparison = enum { compared, skipped, mismatch };
 
 fn sameEvaluation(a: oracle.Evaluation, b: oracle.Evaluation) bool {
@@ -79,7 +91,7 @@ test "evaluation of corpus expressions is unchanged by rendering" {
             const statement = case.sql[pos..][0..result.length];
             pos += result.length;
             if (result.verdict != .accept) continue;
-            if (differential.familyOf(try arena.dupeSentinel(u8, statement, 0)) != .select_expressions) continue;
+            if (!try isConstantSelect(arena, statement)) continue;
             accepted += 1;
             switch (try sameRows(arena, statement)) {
                 .compared => compared += 1,

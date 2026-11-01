@@ -2,6 +2,7 @@
 
 test {
     _ = @import("corpus.zig");
+    _ = @import("depth.zig");
     _ = @import("differential.zig");
     _ = @import("eval_differential.zig");
     _ = @import("oracle.zig");

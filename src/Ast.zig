@@ -2680,6 +2680,7 @@ test "CREATE TABLE references and deferrable clauses" {
         .{ "create table t(a references p, b references p(x, y) on delete set null on update set default)", "CREATE TABLE t (a REFERENCES p, b REFERENCES p (x, y) ON DELETE SET NULL ON UPDATE SET DEFAULT);\n" },
         .{ "create table t(a references p on delete cascade on update restrict on insert no action match full match match)", "CREATE TABLE t (a REFERENCES p ON DELETE CASCADE ON UPDATE RESTRICT ON INSERT NO ACTION MATCH \"full\" MATCH \"match\");\n" },
         .{ "create table t(a deferrable, b not deferrable, c deferrable initially deferred, d not deferrable initially immediate)", "CREATE TABLE t (a DEFERRABLE, b NOT DEFERRABLE, c DEFERRABLE INITIALLY DEFERRED, d NOT DEFERRABLE INITIALLY IMMEDIATE);\n" },
+        .{ "create table t(a null deferrable, b unique not deferrable)", "CREATE TABLE t (a NULL DEFERRABLE, b UNIQUE NOT DEFERRABLE);\n" },
         .{ "create table t(a references p deferrable initially deferred not null)", "CREATE TABLE t (a REFERENCES p DEFERRABLE INITIALLY DEFERRED NOT NULL);\n" },
     };
     for (cases) |case| try expectRender(case[0], case[1]);

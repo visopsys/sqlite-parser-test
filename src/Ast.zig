@@ -1289,3 +1289,59 @@ test "vacuum, reindex and analyze errors" {
     try expectError("reindex a.b.c", "near \".\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
     try expectError("analyze 1", "near \"1\": syntax error", .{ .byte_offset = 8, .line = 1, .column = 9 });
 }
+
+test "SELECT FROM, joins and clauses" {
+    const cases = [_][2][:0]const u8{
+        .{ "SELECT a, b AS c, t.*, * FROM t", "SELECT a, b AS c, t.*, * FROM t;\n" },
+        .{ "SELECT DISTINCT a FROM s.t AS x INDEXED BY i", "SELECT DISTINCT a FROM s.t AS x INDEXED BY i;\n" },
+        .{ "SELECT a FROM t x NOT INDEXED", "SELECT a FROM t AS x NOT INDEXED;\n" },
+        .{ "SELECT a FROM f(1,2)", "SELECT a FROM f(1, 2);\n" },
+        .{ "SELECT a FROM s.f(1) y", "SELECT a FROM s.f(1) AS y;\n" },
+        .{ "SELECT a FROM (SELECT 1) q", "SELECT a FROM (SELECT 1) AS q;\n" },
+        .{ "SELECT a FROM (t1 JOIN t2)", "SELECT a FROM (t1 JOIN t2);\n" },
+        .{ "SELECT a FROM a, b JOIN c ON a.x=c.x", "SELECT a FROM a, b JOIN c ON (a.x = c.x);\n" },
+        .{ "SELECT a FROM a left outer join b using (x,y)", "SELECT a FROM a LEFT OUTER JOIN b USING (x, y);\n" },
+        .{ "SELECT a FROM a NATURAL JOIN b CROSS JOIN c", "SELECT a FROM a NATURAL JOIN b CROSS JOIN c;\n" },
+        .{ "SELECT a FROM t WHERE a GROUP BY a,b HAVING c", "SELECT a FROM t WHERE a GROUP BY a, b HAVING c;\n" },
+        .{ "SELECT a HAVING c", "SELECT a HAVING c;\n" },
+        .{ "SELECT a FROM t ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST", "SELECT a FROM t ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST;\n" },
+        .{ "SELECT 1 LIMIT 1", "SELECT 1 LIMIT 1;\n" },
+        .{ "SELECT 1 LIMIT 1 OFFSET 2", "SELECT 1 LIMIT 1 OFFSET 2;\n" },
+        .{ "SELECT 1 LIMIT 1, 2", "SELECT 1 LIMIT 2 OFFSET 1;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "SELECT compounds, VALUES and subqueries" {
+    const cases = [_][2][:0]const u8{
+        .{ "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 INTERSECT SELECT 4 EXCEPT SELECT 5", "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 INTERSECT SELECT 4 EXCEPT SELECT 5;\n" },
+        .{ "VALUES (1,2),(3,4)", "VALUES (1, 2), (3, 4);\n" },
+        .{ "SELECT 1 UNION VALUES (2)", "SELECT 1 UNION VALUES (2);\n" },
+        .{ "SELECT (SELECT 1)", "SELECT (SELECT 1);\n" },
+        .{ "SELECT EXISTS (SELECT 1)", "SELECT EXISTS (SELECT 1);\n" },
+        .{ "SELECT x IN (SELECT 1)", "SELECT (x IN (SELECT 1));\n" },
+        .{ "SELECT x NOT IN (SELECT 1)", "SELECT (x NOT IN (SELECT 1));\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "SELECT errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "SELECT 1 FROM", "incomplete input", 13 },
+        .{ "SELECT 1 FROM t WHERE", "incomplete input", 21 },
+        .{ "SELECT * FROM t JOIN u ON", "incomplete input", 25 },
+        .{ "SELECT 1 FROM t GROUP x", "near \"x\": syntax error", 22 },
+        .{ "SELECT 1 FROM t LIMIT", "incomplete input", 21 },
+        .{ "SELECT a FROM t ON x", "a JOIN clause is required before ON", 16 },
+        .{ "SELECT * FROM a LEFT FOO JOIN b", "unknown join type: LEFT FOO", 16 },
+        .{ "SELECT * FROM a INNER OUTER JOIN b", "unknown join type: INNER OUTER", 16 },
+        .{ "SELECT 1 ORDER BY 1 UNION SELECT 2", "ORDER BY clause should come after UNION not before", 20 },
+        .{ "SELECT 1 LIMIT 1 EXCEPT SELECT 2", "LIMIT clause should come after EXCEPT not before", 17 },
+        .{ "VALUES", "incomplete input", 6 },
+        .{ "SELECT (SELECT", "incomplete input", 14 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+}

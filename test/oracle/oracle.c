@@ -96,6 +96,49 @@ static int synthesize_schema(sqlite3 *db, const char *msg) {
     return ok;
 }
 
+/* Skips whitespace and comments, then matches word case-insensitively as a whole
+ * word. Advances *p past it on a match. */
+static int next_word_is(const char **p, const char *end, const char *word) {
+    const char *s = *p;
+    for (;;) {
+        while (s < end && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\f')) s++;
+        if (end - s >= 2 && s[0] == '-' && s[1] == '-') {
+            while (s < end && *s != '\n') s++;
+        } else if (end - s >= 2 && s[0] == '/' && s[1] == '*') {
+            s += 2;
+            while (end - s >= 2 && !(s[0] == '*' && s[1] == '/')) s++;
+            s = end - s >= 2 ? s + 2 : end;
+        } else {
+            break;
+        }
+    }
+    size_t n = strlen(word);
+    if ((size_t)(end - s) < n || sqlite3_strnicmp(s, word, (int)n) != 0) return 0;
+    if (s + n < end) {
+        char c = (char)(s[n] | 0x20);
+        if (s[n] == '_' || (c >= 'a' && c <= 'z') || (s[n] >= '0' && s[n] <= '9')) return 0;
+    }
+    *p = s + n;
+    return 1;
+}
+
+/* Whether msg can come from a grammar action, which runs while the parser is
+ * still reading the statement: CREATE x.t and CREATE TRIGGER x.tr look up
+ * database x, and ALTER TABLE and CREATE TRIGGER look up their table. Errors
+ * like "no such table" in a SELECT come from name resolution after the parse,
+ * so the parser saw every token. */
+static int raised_while_parsing(const char *sql, int len, const char *msg) {
+    const char *rest;
+    if (has_prefix(msg, "unknown database ", &rest)) return 1;
+    if (has_prefix(msg, "cannot create INSTEAD OF trigger", &rest)) return 1;
+    if (!has_prefix(msg, "no such table: ", &rest)) return 0;
+    const char *p = sql, *end = sql + len;
+    if (next_word_is(&p, end, "ALTER")) return 1;
+    if (!next_word_is(&p, end, "CREATE")) return 0;
+    if (!next_word_is(&p, end, "TEMP")) next_word_is(&p, end, "TEMPORARY");
+    return next_word_is(&p, end, "TRIGGER");
+}
+
 static void copy_message(struct oracle_result *out, const char *msg) {
     size_t n = strlen(msg);
     if (n >= sizeof(out->message)) n = sizeof(out->message) - 1;
@@ -148,8 +191,12 @@ int oracle_check(const char *sql, int len, struct oracle_result *out) {
         }
         /* SQLite stops parsing at the token where an error is raised and sets
          * tail just past it. A semantic error raised at the end of the
-         * statement means the parser accepted all of it. */
-        if (tail - sql >= out->length) break;
+         * statement means the parser read every token, and, unless a grammar
+         * action raised it, accepted them: CREATE TABLE x.t ( fails on
+         * "unknown database x" before the parser sees that the input ends.
+         * Retrying only those keeps name resolution, which has crashed on
+         * stand-in tables, out of the oracle. */
+        if (tail - sql >= out->length && !raised_while_parsing(sql, out->length, msg)) break;
         if (attempt == 8 || !synthesize_schema(db, msg)) {
             out->verdict = ORACLE_UNKNOWN;
             break;

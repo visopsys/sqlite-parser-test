@@ -92,13 +92,8 @@ fn parseStatement(p: *Parse) Error!Node.Index {
         .keyword_insert, .keyword_replace => return p.parseInsert(),
         .keyword_update => return p.parseUpdate(),
         .keyword_delete => return p.parseDelete(),
-        // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
-        // recognized so far; every statement CREATE can start is still rejected there.
-        .keyword_create => {
-            _ = p.nextToken();
-            if (!p.eat(.keyword_temp)) _ = p.eat(.keyword_unique);
-            return p.failHere();
-        },
+        .keyword_create => return p.parseCreate(),
+        .keyword_alter => return p.parseAlterTable(),
         .keyword_pragma => return p.parsePragma(),
         .keyword_attach => return p.parseAttach(),
         .keyword_detach => return p.parseDetach(),
@@ -375,6 +370,18 @@ fn parseSetItem(p: *Parse) Error!Node.Index {
     });
 }
 
+/// `nm collate sortorder` of an `eidlist`. The grammar takes the decoration and the action
+/// rejects it, when the parser reduces.
+fn parseEidlistName(p: *Parse) Error!u32 {
+    const name = try p.parseName(.nm);
+    const decorated = p.eat(.keyword_collate);
+    if (decorated) _ = try p.parseName(.ids);
+    if (p.eat(.keyword_asc) or p.eat(.keyword_desc) or decorated) {
+        p.deferError(.{ .tag = .syntax_error_after_column_name, .token = @fromBackingInt(p.tok_i) });
+    }
+    return name;
+}
+
 /// `wqitem ::= nm eidlist_opt wqas LP select RP`.
 fn parseCte(p: *Parse) Error!Node.Index {
     const name: TokenIndex = @fromBackingInt(try p.parseName(.nm));
@@ -383,12 +390,7 @@ fn parseCte(p: *Parse) Error!Node.Index {
     try record.appendSlice(p.gpa, &.{ @backingInt(Node.Materialized.any), 0 });
     if (p.eat(.l_paren)) {
         while (true) {
-            try record.append(p.gpa, try p.parseName(.nm));
-            const decorated = p.eat(.keyword_collate);
-            if (decorated) _ = try p.parseName(.ids);
-            if (p.eat(.keyword_asc) or p.eat(.keyword_desc) or decorated) {
-                p.deferError(.{ .tag = .syntax_error_after_column_name, .token = @fromBackingInt(p.tok_i) });
-            }
+            try record.append(p.gpa, try p.parseEidlistName());
             if (!p.eat(.comma)) break;
         }
         if (!p.eat(.r_paren)) return p.failHere();
@@ -499,6 +501,336 @@ fn optionalIndex(node: ?Node.Index) u32 {
 
 fn parseWholeExpr(p: *Parse) Error!Node.Index {
     return p.parseExpr(0);
+}
+
+/// `cmd ::= create_table create_table_args`; only the TABLE form is recognized so far, and
+/// the other statements CREATE can start are rejected at the token after
+/// `CREATE [TEMP | UNIQUE]`.
+fn parseCreate(p: *Parse) Error!Node.Index {
+    const create = p.nextToken();
+    const temp = p.eat(.keyword_temp);
+    if (!p.eat(.keyword_table)) {
+        if (!temp) _ = p.eat(.keyword_unique);
+        return p.failHere();
+    }
+    var record: Node.CreateTable = std.mem.zeroes(Node.CreateTable);
+    record.flags.temp = temp;
+    if (p.eat(.keyword_if)) {
+        if (!p.eat(.keyword_not) or !p.eat(.keyword_exists)) return p.failHere();
+        record.flags.if_not_exists = true;
+    }
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    var query: u32 = 0;
+    if (p.eat(.keyword_as)) {
+        query = @backingInt(try p.parseSelectStatement());
+    } else {
+        const items = try p.parseTableBody();
+        record.items_start = items.lhs;
+        record.items_end = items.rhs;
+        try p.parseTableOptions(&record.flags);
+    }
+    return p.addNode(.{
+        .tag = .create_table,
+        .main_token = create,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = query },
+    });
+}
+
+/// `cmd ::= ALTER TABLE fullname action`. COLUMN has its own meaning after RENAME, ADD and
+/// DROP, so it is never the column name there.
+fn parseAlterTable(p: *Parse) Error!Node.Index {
+    const alter = p.nextToken();
+    if (!p.eat(.keyword_table)) return p.failHere();
+    var record: Node.AlterTable = std.mem.zeroes(Node.AlterTable);
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    switch (p.peek()) {
+        .keyword_rename => {
+            _ = p.nextToken();
+            if (p.eat(.keyword_to)) {
+                record.action = .rename_to;
+                record.first = try p.parseName(.nm);
+            } else {
+                _ = p.eat(.keyword_columnkw);
+                record.action = .rename_column;
+                record.first = try p.parseName(.nm);
+                if (!p.eat(.keyword_to)) return p.failHere();
+                record.second = try p.parseName(.nm);
+            }
+        },
+        .keyword_add => {
+            _ = p.nextToken();
+            _ = p.eat(.keyword_columnkw);
+            record.action = .add_column;
+            record.first = @backingInt(try p.parseColumnDef());
+        },
+        .keyword_drop => {
+            _ = p.nextToken();
+            _ = p.eat(.keyword_columnkw);
+            record.action = .drop_column;
+            record.first = try p.parseName(.nm);
+        },
+        else => return p.failHere(),
+    }
+    return p.addNode(.{
+        .tag = .alter_table,
+        .main_token = alter,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+/// `LP columnlist conslist_opt RP`, as a range of `extra_data`. The comma between
+/// constraints is optional, but once the constraints start no column may follow.
+fn parseTableBody(p: *Parse) Error!Node.Data {
+    if (!p.eat(.l_paren)) return p.failHere();
+    var items: std.ArrayList(u32) = .empty;
+    defer items.deinit(p.gpa);
+    try items.append(p.gpa, @backingInt(try p.parseColumnDef()));
+    while (p.eat(.comma)) {
+        if (!isTableConstraintStart(p.peek())) {
+            try items.append(p.gpa, @backingInt(try p.parseColumnDef()));
+            continue;
+        }
+        try p.parseTableConstraints(&items);
+        break;
+    }
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addExtraRange(items.items);
+}
+
+/// `conslist`, appended to `items`.
+fn parseTableConstraints(p: *Parse, items: *std.ArrayList(u32)) Error!void {
+    while (true) {
+        try items.append(p.gpa, @backingInt(try p.parseTableConstraint()));
+        if (!p.eat(.comma) and !isTableConstraintStart(p.peek())) return;
+    }
+}
+
+fn isTableConstraintStart(tag: Token.Tag) bool {
+    return switch (tag) {
+        .keyword_constraint, .keyword_primary, .keyword_unique, .keyword_check, .keyword_foreign => true,
+        else => false,
+    };
+}
+
+/// `table_option_set`: `WITHOUT ROWID` and `STRICT`, separated by commas, where the first
+/// may be missing before a comma.
+fn parseTableOptions(p: *Parse, flags: *Node.CreateTable.Flags) Error!void {
+    if (p.peek() == .keyword_without or name_tags.get(.nm).contains(p.peek())) try p.parseTableOption(flags);
+    while (p.eat(.comma)) try p.parseTableOption(flags);
+}
+
+/// `table_option`. SQLite rejects any name but `ROWID` after `WITHOUT` and `STRICT` when
+/// the rule reduces.
+fn parseTableOption(p: *Parse, flags: *Node.CreateTable.Flags) Error!void {
+    const without = p.eat(.keyword_without);
+    const name = try p.parseName(.nm);
+    const loc = p.token_locs[name];
+    if (!std.ascii.eqlIgnoreCase(p.source[loc.start..loc.end], if (without) "rowid" else "strict")) {
+        p.deferError(.{ .tag = .unknown_table_option, .token = @fromBackingInt(name) });
+    } else if (without) {
+        flags.without_rowid = true;
+    } else {
+        flags.strict = true;
+    }
+}
+
+/// `columnname carglist`.
+fn parseColumnDef(p: *Parse) Error!Node.Index {
+    const name: TokenIndex = @fromBackingInt(try p.parseName(.nm));
+    const type_start = p.tok_i;
+    try p.parseTypeToken();
+    var record: std.ArrayList(u32) = .empty;
+    defer record.deinit(p.gpa);
+    try record.appendSlice(p.gpa, &.{ type_start, p.tok_i, 0 });
+    while (try p.parseColumnConstraint()) |constraint| {
+        try record.append(p.gpa, @backingInt(constraint));
+        record.items[2] += 1;
+    }
+    return p.addNode(.{
+        .tag = .column_def,
+        .main_token = name,
+        .data = .{ .lhs = try p.addExtra(record.items), .rhs = 0 },
+    });
+}
+
+/// `ccons`, or null when the next token starts none.
+fn parseColumnConstraint(p: *Parse) Error!?Node.Index {
+    const first = p.tok_i;
+    switch (p.peek()) {
+        .keyword_constraint, .keyword_collate => return try p.parseKeywordName(),
+        .keyword_default => return try p.parseDefault(),
+        .keyword_check => return try p.parseCheck(false),
+        .keyword_generated, .keyword_as => {
+            if (p.eat(.keyword_generated) and !p.eat(.keyword_always)) return p.failHere();
+            const as = p.tok_i;
+            if (!p.eat(.keyword_as)) return p.failHere();
+            const expr = try p.parseParenExpr();
+            // The terminal ID, which `id` would also match with INDEXED.
+            const storage = if (p.peek() == .keyword_indexed) null else p.acceptName(.id);
+            return try p.addConstraint(.constraint_expr, as, expr, if (storage) |token| @backingInt(token) else 0);
+        },
+        .keyword_null, .keyword_not, .keyword_primary, .keyword_unique, .keyword_deferrable, .keyword_references => {
+            try p.parseKeywordConstraint();
+            return try p.addConstraint(.constraint_keywords, first, p.tok_i, 0);
+        },
+        else => return null,
+    }
+}
+
+/// The constraints that are only keywords and names: `NULL onconf`, `NOT NULL onconf`,
+/// `PRIMARY KEY sortorder onconf autoinc`, `UNIQUE onconf`, `defer_subclause` and
+/// `REFERENCES nm eidlist_opt refargs`.
+fn parseKeywordConstraint(p: *Parse) Error!void {
+    const first = p.peek();
+    if (first == .keyword_references) return p.parseReferences(false);
+    if (first == .keyword_deferrable or p.token_tags[p.tok_i + 1] == .keyword_deferrable) return p.parseDeferClause();
+    _ = p.nextToken();
+    if (first == .keyword_primary) {
+        if (!p.eat(.keyword_key)) return p.failHere();
+        _ = p.eat(.keyword_asc) or p.eat(.keyword_desc);
+    } else if (first == .keyword_not and !p.eat(.keyword_null)) return p.failHere();
+    _ = try p.parseOnConf();
+    if (first == .keyword_primary) _ = p.eat(.keyword_autoincr);
+}
+
+/// `tcons`.
+fn parseTableConstraint(p: *Parse) Error!Node.Index {
+    const first = p.tok_i;
+    switch (p.peek()) {
+        .keyword_constraint => return p.parseKeywordName(),
+        .keyword_check => return p.parseCheck(true),
+        .keyword_primary, .keyword_unique => {
+            const is_primary = p.peek() == .keyword_primary;
+            _ = p.nextToken();
+            if (is_primary and !p.eat(.keyword_key)) return p.failHere();
+            if (!p.eat(.l_paren)) return p.failHere();
+            const list = try p.parseCommaList(parseOrderItem);
+            const autoincrement: u32 = if (is_primary and p.peek() == .keyword_autoincr) @backingInt(p.nextToken()) else 0;
+            if (!p.eat(.r_paren)) return p.failHere();
+            const key: Node.Key = .{ .list_start = list.lhs, .list_end = list.rhs, .autoincrement = autoincrement, .conflict = try p.parseOnConf() };
+            return p.addConstraint(.constraint_key, first, try p.addExtra(@ptrCast(&key)), 0);
+        },
+        .keyword_foreign => {
+            _ = p.nextToken();
+            if (!p.eat(.keyword_key)) return p.failHere();
+            try p.parseNameList();
+            if (p.peek() != .keyword_references) return p.failHere();
+            try p.parseReferences(true);
+            return p.addConstraint(.constraint_keywords, first, p.tok_i, 0);
+        },
+        else => return p.failHere(),
+    }
+}
+
+/// `CONSTRAINT nm` and `COLLATE ids`.
+fn parseKeywordName(p: *Parse) Error!Node.Index {
+    const first = p.tok_i;
+    _ = p.nextToken();
+    const class: NameClass = if (p.token_tags[first] == .keyword_constraint) .nm else .ids;
+    return p.addConstraint(.constraint_name, first, try p.parseName(class), 0);
+}
+
+fn addConstraint(p: *Parse, tag: Node.Tag, main_token: u32, lhs: u32, rhs: u32) Error!Node.Index {
+    return p.addNode(.{ .tag = tag, .main_token = @fromBackingInt(main_token), .data = .{ .lhs = lhs, .rhs = rhs } });
+}
+
+/// `onconf`: the token after `ON CONFLICT`, or 0.
+fn parseOnConf(p: *Parse) Error!u32 {
+    if (!p.eat(.keyword_on)) return 0;
+    if (!p.eat(.keyword_conflict)) return p.failHere();
+    switch (p.peek()) {
+        .keyword_rollback, .keyword_abort, .keyword_fail, .keyword_ignore, .keyword_replace => {},
+        else => return p.failHere(),
+    }
+    return @backingInt(p.nextToken());
+}
+
+/// `LP expr RP`.
+fn parseParenExpr(p: *Parse) Error!u32 {
+    if (!p.eat(.l_paren)) return p.failHere();
+    const expr = try p.parseExpr(0);
+    if (!p.eat(.r_paren)) return p.failHere();
+    return @backingInt(expr);
+}
+
+/// `CHECK LP expr RP`, followed by `onconf` in a table constraint.
+fn parseCheck(p: *Parse, is_table: bool) Error!Node.Index {
+    const first = p.nextToken();
+    const expr = try p.parseParenExpr();
+    return p.addConstraint(.constraint_expr, @backingInt(first), expr, if (is_table) try p.parseOnConf() else 0);
+}
+
+/// `DEFAULT term`, `DEFAULT [PLUS | MINUS] term`, `DEFAULT LP expr RP` or `DEFAULT id`.
+fn parseDefault(p: *Parse) Error!Node.Index {
+    const first = p.nextToken();
+    const operand: u32 = switch (p.peek()) {
+        .l_paren => try p.parseParenExpr(),
+        .plus, .minus => plus: {
+            _ = p.nextToken();
+            break :plus @backingInt(try p.parseTerm() orelse return p.failHere());
+        },
+        else => if (try p.parseTerm()) |term| @backingInt(term) else name: {
+            _ = try p.parseName(.id);
+            break :name 0;
+        },
+    };
+    return p.addConstraint(.constraint_default, @backingInt(first), operand, 0);
+}
+
+/// `term` in the forms a column default can take, or null at any other token.
+fn parseTerm(p: *Parse) Error!?Node.Index {
+    switch (p.peek()) {
+        .integer_literal, .float_literal, .blob_literal, .string_literal, .keyword_null, .keyword_ctime_kw => {},
+        else => return null,
+    }
+    return try p.addNode(.{ .tag = .literal, .main_token = p.nextToken(), .data = .{ .lhs = 0, .rhs = 0 } });
+}
+
+/// `defer_subclause`, at its `NOT` or `DEFERRABLE`.
+fn parseDeferClause(p: *Parse) Error!void {
+    _ = p.eat(.keyword_not);
+    if (!p.eat(.keyword_deferrable)) return p.failHere();
+    if (p.eat(.keyword_initially) and !p.eat(.keyword_deferred) and !p.eat(.keyword_immediate)) return p.failHere();
+}
+
+/// `REFERENCES nm eidlist_opt refargs`, and `defer_subclause_opt` when `is_foreign`.
+fn parseReferences(p: *Parse, is_foreign: bool) Error!void {
+    _ = p.nextToken();
+    _ = try p.parseName(.nm);
+    if (p.peek() == .l_paren) try p.parseNameList();
+    while (true) {
+        if (p.eat(.keyword_match)) {
+            _ = try p.parseName(.nm);
+        } else if (p.eat(.keyword_on)) {
+            if (!p.eat(.keyword_insert) and !p.eat(.keyword_delete) and !p.eat(.keyword_update)) return p.failHere();
+            const ok = if (p.eat(.keyword_set))
+                p.eat(.keyword_null) or p.eat(.keyword_default)
+            else if (p.eat(.keyword_no))
+                p.eat(.keyword_action)
+            else
+                p.eat(.keyword_cascade) or p.eat(.keyword_restrict);
+            if (!ok) return p.failHere();
+        } else break;
+    }
+    if (is_foreign and (p.peek() == .keyword_not or p.peek() == .keyword_deferrable)) try p.parseDeferClause();
+}
+
+/// `LP eidlist RP`.
+fn parseNameList(p: *Parse) Error!void {
+    if (!p.eat(.l_paren)) return p.failHere();
+    while (true) {
+        _ = try p.parseEidlistName();
+        if (!p.eat(.comma)) break;
+    }
+    if (!p.eat(.r_paren)) return p.failHere();
 }
 
 /// `item (COMMA item)*`, stored as a range of `extra_data`.
@@ -1049,22 +1381,14 @@ fn parsePrimary(p: *Parse) Error!Node.Index {
     return p.addNode(.{ .tag = .name, .main_token = main_token, .data = .{ .lhs = parts, .rhs = 0 } });
 }
 
-/// `CAST LP expr AS typetoken RP`, where `typetoken` is any number of `ids` and then
-/// `(signed)` or `(signed, signed)`, the last two only after a name.
+/// `CAST LP expr AS typetoken RP`.
 fn parseCast(p: *Parse) Error!Node.Index {
     const cast = p.nextToken();
     if (!p.eat(.l_paren)) return p.failHere();
     const operand = try p.parseExpr(0);
     if (!p.eat(.keyword_as)) return p.failHere();
     const type_start = p.tok_i;
-    if (p.acceptName(.ids) != null) {
-        while (p.acceptName(.ids) != null) {}
-        if (p.eat(.l_paren)) {
-            try p.parseSigned();
-            if (p.eat(.comma)) try p.parseSigned();
-            if (!p.eat(.r_paren)) return p.failHere();
-        }
-    }
+    try p.parseTypeToken();
     const type_end = p.tok_i;
     if (!p.eat(.r_paren)) return p.failHere();
     return p.addNode(.{
@@ -1072,6 +1396,18 @@ fn parseCast(p: *Parse) Error!Node.Index {
         .main_token = cast,
         .data = .{ .lhs = @backingInt(operand), .rhs = try p.addExtra(&.{ type_start, type_end }) },
     });
+}
+
+/// `typetoken`: any number of `ids` and then `(signed)` or `(signed, signed)`, the last
+/// two only after a name.
+fn parseTypeToken(p: *Parse) Error!void {
+    if (p.acceptName(.ids) == null) return;
+    while (p.acceptName(.ids) != null) {}
+    if (p.eat(.l_paren)) {
+        try p.parseSigned();
+        if (p.eat(.comma)) try p.parseSigned();
+        if (!p.eat(.r_paren)) return p.failHere();
+    }
 }
 
 /// `signed ::= [PLUS | MINUS] number`.

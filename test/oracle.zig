@@ -102,6 +102,11 @@ test "accepts valid statements, including ones with semantic errors" {
     try expectVerdict("-- only a comment", .accept);
     try expectVerdict("SELECT 1 /* unterminated comment", .accept);
     try expectVerdict("ATTACH 'never-created.db' AS x", .accept);
+    // Name resolution runs after the parse, so the oracle creates no stand-ins for it.
+    // SQLite 3.45.1 crashes resolving this one against them.
+    try expectVerdict("SELECT * FROM t5 JOIN ((t4 JOIN (t5 JOIN t6)) t7)", .accept);
+    try expectVerdict("ALTER TABLE t ADD", .reject);
+    try expectVerdict("CREATE TRIGGER tr AFTER INSERT ON t BEGIN", .reject);
 }
 
 test "creates stand-ins for missing schema objects" {
@@ -111,6 +116,11 @@ test "creates stand-ins for missing schema objects" {
     try expectVerdict("CREATE TABLE aux.t(a)", .accept);
     try expectVerdict("SELECT 1 COLLATE no_such_collation", .accept);
     try expectVerdict("CREATE TRIGGER tr AFTER INSERT ON t BEGIN garbage; END", .reject);
+    // "unknown database aux" is raised on the last token, before the parser sees
+    // that the statement ends too early.
+    const r = try check("CREATE TABLE aux.t (");
+    try std.testing.expectEqual(Verdict.reject, r.verdict);
+    try std.testing.expectEqualStrings("incomplete input", r.messageText());
 }
 
 test "rejects syntax errors with SQLite's message and offset" {

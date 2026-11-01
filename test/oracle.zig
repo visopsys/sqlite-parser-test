@@ -111,6 +111,14 @@ test "accepts valid statements, including ones with semantic errors" {
     try expectVerdict("CREATE TABLE t(a COLLATE c)", .accept);
 }
 
+test "reports unknown when a grammar action's error on the last token hides the end" {
+    try expectVerdict("CREATE TABLE t(a AS (1) instead null", .unknown);
+    try expectVerdict("CREATE TABLE t(a AS (1) instead)", .unknown);
+    try expectVerdict("SELECT * FROM no_such_table WHERE", .reject);
+    // sqlite3EndTable() replaces the "unknown table option" error.
+    try expectVerdict("CREATE TABLE t(a AS (1)) bogus", .unknown);
+}
+
 test "creates stand-ins for missing schema objects" {
     try expectVerdict("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END", .accept);
     try expectVerdict("CREATE TRIGGER tr INSTEAD OF INSERT ON v BEGIN SELECT 1; END", .accept);
@@ -158,6 +166,25 @@ test "splits statements the way sqlite3_complete does" {
     r = try check(script[9 + r.length ..]);
     try std.testing.expectEqual(Verdict.reject, r.verdict);
     try std.testing.expectEqualStrings("incomplete input", r.messageText());
+}
+
+test "splits statements where SQLite's parser ends them" {
+    // sqlite3_complete() ends the statement at the ';', but SQLite's tokenizer reads
+    // $a(b;) as one variable token.
+    var r = try check("SELECT $a(b;); SELECT 2");
+    try std.testing.expectEqual(@as(u32, 14), r.length);
+    try std.testing.expectEqual(Verdict.accept, r.verdict);
+    r = try check("$a(b;)");
+    try std.testing.expectEqual(@as(u32, 6), r.length);
+    try std.testing.expectEqualStrings("near \"$a(b;)\": syntax error", r.messageText());
+    r = try check("CREATE VIRTUAL TABLE v USING m(a;b); SELECT 2");
+    try std.testing.expectEqual(@as(u32, 36), r.length);
+    try std.testing.expectEqual(Verdict.accept, r.verdict);
+    r = try check("CREATE VIRTUAL TABLE v USING m(a;b");
+    try std.testing.expectEqual(@as(u32, 34), r.length);
+    try std.testing.expectEqualStrings("incomplete input", r.messageText());
+    r = try check("SELECT ';', \"a;\", [b;] -- ;\n; SELECT 2");
+    try std.testing.expectEqual(@as(u32, 29), r.length);
 }
 
 test "evaluates read-only statements only" {

@@ -16,7 +16,9 @@ enum oracle_verdict {
 struct oracle_result {
     int verdict;
     /* Byte length of the checked statement: through its terminating ';' as
-     * sqlite3_complete() finds it, or to the end of the input. */
+     * sqlite3_complete() finds it, extended to where SQLite's parser ended
+     * the statement when that is later (a ';' inside $a(b;) or inside the
+     * arguments of CREATE VIRTUAL TABLE), or to the end of the input. */
     int length;
     /* For ORACLE_REJECT: the byte offset (from the start of the input) of the
      * token SQLite blames, or -1 when SQLite reports none ("incomplete input"). */

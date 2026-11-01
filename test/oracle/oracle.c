@@ -27,10 +27,63 @@ static int is_syntax_error(const char *msg) {
     return 0;
 }
 
-/* Length of the first statement in sql[0..len): the shortest prefix ending in
- * ';' that sqlite3_complete() calls complete, or len. buf has room for len+1. */
+/* IdChar in tokenize.c. */
+static int is_id_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '$' || c >= 0x80;
+}
+
+/* Length of the token-like run at sql[i..len) that can hold a ';' that does not
+ * end a statement: a string, quoted identifier, comment, or TCL-style variable
+ * such as $a(b;c). sqlite3_complete() does not know the last kind, so it must be
+ * skipped here. Returns 1 for any other byte. */
+static int skip_token(const char *sql, int len, int i) {
+    unsigned char c = (unsigned char)sql[i];
+    int j = i + 1;
+    if (c == '\'' || c == '"' || c == '`' || c == '[') {
+        char close = c == '[' ? ']' : (char)c;
+        while (j < len && sql[j] != close) j++;
+        return (j < len ? j + 1 : len) - i;
+    }
+    if (c == '-' && j < len && sql[j] == '-') {
+        while (j < len && sql[j] != '\n') j++;
+        return j - i;
+    }
+    if (c == '/' && j < len && sql[j] == '*') {
+        j++;
+        while (j + 1 < len && !(sql[j] == '*' && sql[j + 1] == '/')) j++;
+        return (j + 1 < len ? j + 2 : len) - i;
+    }
+    if (c == '$' || c == '@' || c == ':' || c == '#') {
+        int n = 0;
+        for (; j < len; j++) {
+            unsigned char d = (unsigned char)sql[j];
+            if (is_id_char(d)) {
+                n++;
+            } else if (d == '(' && n > 0) {
+                do j++;
+                while (j < len && sql[j] != ')' && sql[j] != ' ' && (sql[j] < '\t' || sql[j] > '\r'));
+                return (j < len && sql[j] == ')' ? j + 1 : j) - i;
+            } else if (d == ':' && j + 1 < len && sql[j + 1] == ':') {
+                j++;
+            } else {
+                break;
+            }
+        }
+        return j - i;
+    }
+    if (is_id_char(c)) {
+        while (j < len && is_id_char((unsigned char)sql[j])) j++;
+        return j - i;
+    }
+    return 1;
+}
+
+/* Length of the first statement in sql[0..len): the shortest prefix ending in a
+ * ';' token that sqlite3_complete() calls complete, or len. buf has room for
+ * len+1. */
 static int statement_length(const char *sql, int len, char *buf) {
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < len; i += skip_token(sql, len, i)) {
         if (sql[i] != ';') continue;
         memcpy(buf, sql, (size_t)i + 1);
         buf[i + 1] = 0;
@@ -122,6 +175,17 @@ static int next_word_is(const char **p, const char *end, const char *word) {
     return 1;
 }
 
+/* Errors from sqlite3EndTable(), which runs in the same reduction as the table
+ * options and replaces an "unknown table option" error raised there, so the
+ * oracle cannot tell whether the options were valid. */
+static const char *const end_table_messages[] = {
+    "missing datatype for ",
+    "unknown datatype for ",
+    "AUTOINCREMENT not allowed on WITHOUT ROWID tables",
+    "PRIMARY KEY missing on table ",
+    "must have at least one non-generated column",
+};
+
 /* Whether msg can come from a grammar action, which runs while the parser is
  * still reading the statement: CREATE x.t and CREATE TRIGGER x.tr look up
  * database x, ALTER TABLE and CREATE TRIGGER look up their table, and a COLLATE
@@ -130,6 +194,9 @@ static int next_word_is(const char **p, const char *end, const char *word) {
  * token. */
 static int raised_while_parsing(const char *sql, int len, const char *msg) {
     const char *rest;
+    for (size_t i = 0; i < sizeof(end_table_messages) / sizeof(end_table_messages[0]); i++) {
+        if (has_prefix(msg, end_table_messages[i], &rest)) return 1;
+    }
     if (has_prefix(msg, "unknown database ", &rest)) return 1;
     if (has_prefix(msg, "cannot create INSTEAD OF trigger", &rest)) return 1;
     const char *p = sql, *end = sql + len;
@@ -141,6 +208,31 @@ static int raised_while_parsing(const char *sql, int len, const char *msg) {
     if (!next_word_is(&p, end, "CREATE")) return 0;
     if (!next_word_is(&p, end, "TEMP")) next_word_is(&p, end, "TEMPORARY");
     return next_word_is(&p, end, "TRIGGER");
+}
+
+/* For a statement that SQLite stopped on its last token with a semantic error:
+ * whether the error came after the parser read the whole statement. SQLite
+ * feeds the parser a virtual ';' at the end of the input and reports tail at
+ * the end either way, so the statement is prepared again with a real ';'
+ * appended: an error raised while reducing the last token stops before that
+ * ';', one raised after the parse stops after it. Returns 1 or 0, or -1 when
+ * out of memory. A statement that already ends in ';' answers 1; for those,
+ * raised_while_parsing() is all the oracle knows. */
+static int stopped_at_terminator(sqlite3 *db, const char *sql, int len) {
+    int end = len;
+    while (end > 0 && (sql[end - 1] == ' ' || (sql[end - 1] >= '\t' && sql[end - 1] <= '\r'))) end--;
+    if (end > 0 && sql[end - 1] == ';') return 1;
+    char *copy = sqlite3_malloc(len + 3);
+    if (copy == 0) return -1;
+    memcpy(copy, sql, (size_t)len);
+    memcpy(copy + len, "\n;", 3);
+    sqlite3_stmt *stmt = 0;
+    const char *tail = 0;
+    int rc = sqlite3_prepare_v3(db, copy, len + 2, 0, &stmt, &tail);
+    sqlite3_finalize(stmt);
+    int result = rc == SQLITE_NOMEM ? -1 : tail - copy >= len + 2;
+    sqlite3_free(copy);
+    return result;
 }
 
 static void copy_message(struct oracle_result *out, const char *msg) {
@@ -173,15 +265,23 @@ int oracle_check(const char *sql, int len, struct oracle_result *out) {
     out->length = statement_length(sql, len, buf);
     sqlite3_free(buf);
 
+    /* SQLite reads the statement from the whole input: a ';' inside the
+     * arguments of CREATE VIRTUAL TABLE does not end it, though
+     * sqlite3_complete() says it does. The statement then ends where SQLite
+     * stopped: after the tail it reports, or, for an error past the split, at
+     * the end of the input. */
     sqlite3 *db = 0;
     int rc = open_db(&db);
     if (rc != SQLITE_OK) return rc;
     for (int attempt = 0;; attempt++) {
         sqlite3_stmt *stmt = 0;
         const char *tail = 0;
-        rc = sqlite3_prepare_v3(db, sql, out->length, 0, &stmt, &tail);
+        rc = sqlite3_prepare_v3(db, sql, len, 0, &stmt, &tail);
         sqlite3_finalize(stmt);
-        if (rc == SQLITE_OK) break;
+        if (rc == SQLITE_OK) {
+            if (tail - sql > out->length) out->length = (int)(tail - sql);
+            break;
+        }
         if (rc == SQLITE_NOMEM) {
             sqlite3_close(db);
             return rc;
@@ -191,6 +291,9 @@ int oracle_check(const char *sql, int len, struct oracle_result *out) {
         if (is_syntax_error(msg)) {
             out->verdict = ORACLE_REJECT;
             out->error_offset = sqlite3_error_offset(db);
+            if (out->error_offset >= out->length || (out->error_offset < 0 && tail - sql > out->length)) {
+                out->length = len;
+            }
             break;
         }
         /* SQLite stops parsing at the token where an error is raised and sets
@@ -200,7 +303,14 @@ int oracle_check(const char *sql, int len, struct oracle_result *out) {
          * "unknown database x" before the parser sees that the input ends.
          * Retrying only those keeps name resolution, which has crashed on
          * stand-in tables, out of the oracle. */
-        if (tail - sql >= out->length && !raised_while_parsing(sql, out->length, msg)) break;
+        if (tail - sql >= out->length && !raised_while_parsing(sql, out->length, msg)) {
+            int parsed = stopped_at_terminator(db, sql, out->length);
+            if (parsed < 0) {
+                sqlite3_close(db);
+                return SQLITE_NOMEM;
+            }
+            if (parsed) break;
+        }
         if (attempt == 8 || !synthesize_schema(db, msg)) {
             out->verdict = ORACLE_UNKNOWN;
             break;

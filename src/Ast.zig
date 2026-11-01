@@ -2019,3 +2019,73 @@ test "INSERT errors" {
         try expectError(source, "incomplete input", .{ .byte_offset = source.len, .line = 1, .column = source.len + 1 });
     }
 }
+
+test "DELETE" {
+    const cases = [_][2][:0]const u8{
+        .{ "delete from t", "DELETE FROM t;\n" },
+        .{ "delete from main.t as x where a = 1", "DELETE FROM main.t AS x WHERE (a = 1);\n" },
+        .{ "delete from t indexed by i where a", "DELETE FROM t INDEXED BY i WHERE a;\n" },
+        .{ "delete from t not indexed", "DELETE FROM t NOT INDEXED;\n" },
+        .{ "delete from t returning *, a as b", "DELETE FROM t RETURNING *, a AS b;\n" },
+        .{
+            "delete from t where a returning a order by a desc limit 1 offset 2",
+            "DELETE FROM t WHERE a RETURNING a ORDER BY a DESC LIMIT 1 OFFSET 2;\n",
+        },
+        .{ "delete from t limit 1, 2", "DELETE FROM t LIMIT 2 OFFSET 1;\n" },
+        .{ "with recursive c(x) as (select 1) delete from t where a in c", "WITH RECURSIVE c(x) AS (SELECT 1) DELETE FROM t WHERE (a IN c);\n" },
+        .{ "explain delete from t", "EXPLAIN DELETE FROM t;\n" },
+        .{ "explain query plan delete from t where a", "EXPLAIN QUERY PLAN DELETE FROM t WHERE a;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "UPDATE" {
+    const cases = [_][2][:0]const u8{
+        .{ "update t set a = 1", "UPDATE t SET a = 1;\n" },
+        .{ "update or replace t set a = 1, (b, c) = (2, 3)", "UPDATE OR REPLACE t SET a = 1, (b, c) = (2, 3);\n" },
+        .{ "update or abort t set a = 1", "UPDATE OR ABORT t SET a = 1;\n" },
+        .{ "update or fail t set a = 1", "UPDATE OR FAIL t SET a = 1;\n" },
+        .{ "update or ignore t set a = 1", "UPDATE OR IGNORE t SET a = 1;\n" },
+        .{ "update or rollback t set a = 1", "UPDATE OR ROLLBACK t SET a = 1;\n" },
+        .{
+            "update s.t as u indexed by i set a = 1 from t2 join t3 on x where y returning a order by a limit 3",
+            "UPDATE s.t AS u INDEXED BY i SET a = 1 FROM t2 JOIN t3 ON x WHERE y RETURNING a ORDER BY a LIMIT 3;\n",
+        },
+        .{ "update t not indexed set a=1", "UPDATE t NOT INDEXED SET a = 1;\n" },
+        .{ "update t set a=1 limit 1, 2", "UPDATE t SET a = 1 LIMIT 2 OFFSET 1;\n" },
+        .{ "with c as (select 1) update t set a = (select * from c)", "WITH c AS (SELECT 1) UPDATE t SET a = (SELECT * FROM c);\n" },
+        .{ "with c as (select 1) select 1", "WITH c AS (SELECT 1) SELECT 1;\n" },
+        .{ "explain update t set a = 1", "EXPLAIN UPDATE t SET a = 1;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "UPDATE and DELETE errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const syntax = [_]Case{
+        .{ "update or foo t set a=1", "near \"foo\": syntax error", 10 },
+        .{ "delete t", "near \"t\": syntax error", 7 },
+        .{ "delete from t limit 1 order by a", "near \"order\": syntax error", 22 },
+        .{ "update t set a=1 not indexed", "near \"indexed\": syntax error", 21 },
+    };
+    for (syntax) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+
+    const incomplete = [_][:0]const u8{
+        "update t",
+        "update t set",
+        "update t set a",
+        "update t set a=1 returning",
+        "delete from",
+        "delete from t where",
+        "delete from t order by",
+        "delete from t limit",
+        "with c as (select 1) update",
+    };
+    for (incomplete) |source| {
+        try expectError(source, "incomplete input", .{ .byte_offset = source.len, .line = 1, .column = source.len + 1 });
+    }
+
+    try expectError("delete from t\nlimit", "incomplete input", .{ .byte_offset = 19, .line = 2, .column = 6 });
+}

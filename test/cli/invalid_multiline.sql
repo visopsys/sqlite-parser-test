@@ -1,0 +1,3 @@
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1, 2);
+  SELECT a FROM FROM t;

@@ -89,6 +89,11 @@ fn parseStatement(p: *Parse) Error!Node.Index {
             if (!p.eat(.keyword_temp)) _ = p.eat(.keyword_unique);
             return p.failHere();
         },
+        .keyword_pragma => return p.parsePragma(),
+        .keyword_attach => return p.parseAttach(),
+        .keyword_detach => return p.parseDetach(),
+        .keyword_vacuum => return p.parseVacuum(),
+        .keyword_reindex, .keyword_analyze => return p.parseReindexOrAnalyze(),
         .keyword_begin, .keyword_commit, .keyword_end, .keyword_rollback, .keyword_savepoint, .keyword_release => {},
         else => return p.failHere(),
     }
@@ -130,6 +135,84 @@ fn parseSelect(p: *Parse) Error!Node.Index {
         .main_token = select,
         .data = try p.addExtraRange(columns.items),
     });
+}
+
+/// `PRAGMA nm dbnm`, optionally followed by `EQ` or `LP` and a value, then `RP`.
+fn parsePragma(p: *Parse) Error!Node.Index {
+    const pragma = p.nextToken();
+    const first = try p.parseName(.nm);
+    const second = if (p.eat(.dot)) try p.parseName(.nm) else 0;
+    const form: u32 = switch (p.peek()) {
+        .equal, .equal_equal, .l_paren => @backingInt(p.nextToken()),
+        else => 0,
+    };
+    var sign: u32 = 0;
+    var value: u32 = 0;
+    if (form != 0) {
+        if (p.peek() == .plus or p.peek() == .minus) sign = @backingInt(p.nextToken());
+        value = switch (p.peek()) {
+            .integer_literal, .float_literal => @backingInt(p.nextToken()),
+            .keyword_on, .keyword_delete, .keyword_default => if (sign == 0) @backingInt(p.nextToken()) else return p.failHere(),
+            else => if (sign == 0) try p.parseName(.nm) else return p.failHere(),
+        };
+        if (p.token_tags[form] == .l_paren and !p.eat(.r_paren)) return p.failHere();
+    }
+    return p.addNode(.{
+        .tag = .pragma,
+        .main_token = pragma,
+        .data = .{ .lhs = first, .rhs = try p.addExtra(&.{ second, form, sign, value }) },
+    });
+}
+
+/// `ATTACH database_kw_opt expr AS expr key_opt`.
+fn parseAttach(p: *Parse) Error!Node.Index {
+    const attach = p.nextToken();
+    _ = p.eat(.keyword_database);
+    const file = try p.parseExpr(0);
+    if (!p.eat(.keyword_as)) return p.failHere();
+    const name = try p.parseExpr(0);
+    const key = if (p.eat(.keyword_key)) try p.parseExpr(0) else null;
+    return p.addNode(.{
+        .tag = .attach,
+        .main_token = attach,
+        .data = .{
+            .lhs = @backingInt(file),
+            .rhs = try p.addExtra(&.{ @backingInt(name), if (key) |k| @backingInt(k) else 0 }),
+        },
+    });
+}
+
+/// `DETACH database_kw_opt expr`.
+fn parseDetach(p: *Parse) Error!Node.Index {
+    const detach = p.nextToken();
+    _ = p.eat(.keyword_database);
+    const database = try p.parseExpr(0);
+    return p.addNode(.{
+        .tag = .detach,
+        .main_token = detach,
+        .data = .{ .lhs = @backingInt(database), .rhs = 0 },
+    });
+}
+
+/// `VACUUM [nm] vinto`, where `vinto ::= INTO expr | `.
+fn parseVacuum(p: *Parse) Error!Node.Index {
+    const vacuum = p.nextToken();
+    const schema = if (p.acceptName(.nm)) |name| @backingInt(name) else 0;
+    const into = if (p.eat(.keyword_into)) @backingInt(try p.parseExpr(0)) else 0;
+    return p.addNode(.{ .tag = .vacuum, .main_token = vacuum, .data = .{ .lhs = schema, .rhs = into } });
+}
+
+/// `REINDEX` or `ANALYZE`, each optionally followed by `nm dbnm`.
+fn parseReindexOrAnalyze(p: *Parse) Error!Node.Index {
+    const tag: Node.Tag = if (p.peek() == .keyword_reindex) .reindex else .analyze;
+    const keyword = p.nextToken();
+    var first: u32 = 0;
+    var second: u32 = 0;
+    if (p.acceptName(.nm)) |name| {
+        first = @backingInt(name);
+        if (p.eat(.dot)) second = try p.parseName(.nm);
+    }
+    return p.addNode(.{ .tag = tag, .main_token = keyword, .data = .{ .lhs = first, .rhs = second } });
 }
 
 /// `selcollist ::= expr as | STAR`, where `as ::= AS nm | ids | `.

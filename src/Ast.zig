@@ -82,6 +82,23 @@ pub const Node = struct {
         savepoint,
         /// `RELEASE [SAVEPOINT] name`. `lhs` is the name token.
         release,
+        /// `PRAGMA first[.second] [= value | (value)]`. `lhs` is the first name token and
+        /// `rhs` the index in `extra_data` of four tokens: the second name, the `=` or `(`,
+        /// the `+` or `-` sign, and the value (a number, `ON`, `DELETE`, `DEFAULT` or a
+        /// name), each 0 when absent (no token that follows `PRAGMA` has index 0).
+        pragma,
+        /// `ATTACH [DATABASE] lhs AS expr [KEY expr]`. `rhs` is the index in `extra_data`
+        /// of the name expression and the key expression, which is 0 when absent.
+        attach,
+        /// `DETACH [DATABASE] lhs`.
+        detach,
+        /// `VACUUM [schema] [INTO expr]`. `lhs` is the schema name token and `rhs` the
+        /// expression, each 0 when absent.
+        vacuum,
+        /// `REINDEX [first [. second]]`. `lhs` and `rhs` are the name tokens, 0 when absent.
+        reindex,
+        /// `ANALYZE [first [. second]]`, laid out like `reindex`.
+        analyze,
         /// `SELECT [ALL] columns`. `lhs..rhs` is the range of `extra_data` holding the
         /// `result_star` and `result_expr` nodes. `main_token` is `SELECT`.
         select,
@@ -306,6 +323,62 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .savepoint, .release => {
             try writer.writeAll(if (n.tag == .savepoint) "SAVEPOINT " else "RELEASE ");
             try self.renderName(n.data.lhs, writer);
+        },
+        .pragma => {
+            const pragma = self.extra_data[n.data.rhs..][0..4];
+            try writer.writeAll("PRAGMA ");
+            try self.renderName(n.data.lhs, writer);
+            if (pragma[0] != 0) {
+                try writer.writeByte('.');
+                try self.renderName(pragma[0], writer);
+            }
+            if (pragma[1] == 0) return;
+            const tags = self.tokens.items(.tag);
+            try writer.writeAll(if (tags[pragma[1]] == .l_paren) "(" else " = ");
+            if (pragma[2] != 0) try writer.writeAll(self.tokenText(@fromBackingInt(pragma[2])));
+            switch (tags[pragma[3]]) {
+                .integer_literal, .float_literal => try writer.writeAll(self.tokenText(@fromBackingInt(pragma[3]))),
+                .keyword_on, .keyword_delete, .keyword_default => try writeUpper(self.tokenText(@fromBackingInt(pragma[3])), writer),
+                else => try self.renderName(pragma[3], writer),
+            }
+            if (tags[pragma[1]] == .l_paren) try writer.writeByte(')');
+        },
+        .attach => {
+            const name, const key = self.extra_data[n.data.rhs..][0..2].*;
+            try writer.writeAll("ATTACH DATABASE ");
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeAll(" AS ");
+            try self.renderExpr(@fromBackingInt(@intCast(name)), writer);
+            if (key != 0) {
+                try writer.writeAll(" KEY ");
+                try self.renderExpr(@fromBackingInt(@intCast(key)), writer);
+            }
+        },
+        .detach => {
+            try writer.writeAll("DETACH DATABASE ");
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+        },
+        .vacuum => {
+            try writer.writeAll("VACUUM");
+            if (n.data.lhs != 0) {
+                try writer.writeByte(' ');
+                try self.renderName(n.data.lhs, writer);
+            }
+            if (n.data.rhs != 0) {
+                try writer.writeAll(" INTO ");
+                try self.renderExpr(@fromBackingInt(@intCast(n.data.rhs)), writer);
+            }
+        },
+        .reindex, .analyze => {
+            try writer.writeAll(if (n.tag == .reindex) "REINDEX" else "ANALYZE");
+            if (n.data.lhs != 0) {
+                try writer.writeByte(' ');
+                try self.renderName(n.data.lhs, writer);
+            }
+            if (n.data.rhs != 0) {
+                try writer.writeByte('.');
+                try self.renderName(n.data.rhs, writer);
+            }
         },
         .select, .select_distinct => {
             try writer.writeAll(if (n.tag == .select) "SELECT " else "SELECT DISTINCT ");
@@ -1131,4 +1204,88 @@ test "register variables are rejected unless the next token is the error" {
     try expectError("SELECT +#1 )", "near \")\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
     try expectError("SELECT #1 #2", "near \"#2\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
     try expectRender("SELECT #abc, #x1", "SELECT #abc, #x1;\n");
+}
+
+test "pragma" {
+    try expectRender("pragma p", "PRAGMA p;\n");
+    try expectRender("pragma s.p", "PRAGMA s.p;\n");
+    try expectRender("pragma p=1", "PRAGMA p = 1;\n");
+    try expectRender("pragma p=+1", "PRAGMA p = +1;\n");
+    try expectRender("pragma p == delete", "PRAGMA p = DELETE;\n");
+    try expectRender("pragma p=-1.5", "PRAGMA p = -1.5;\n");
+    try expectRender("pragma p = - 1", "PRAGMA p = -1;\n");
+    try expectRender("pragma p(x)", "PRAGMA p(x);\n");
+    try expectRender("pragma p(-1)", "PRAGMA p(-1);\n");
+    try expectRender("pragma p(+0x10)", "PRAGMA p(+0x10);\n");
+    try expectRender("pragma p=on", "PRAGMA p = ON;\n");
+    try expectRender("pragma p=delete", "PRAGMA p = DELETE;\n");
+    try expectRender("pragma p(default)", "PRAGMA p(DEFAULT);\n");
+    try expectRender("pragma p='str'", "PRAGMA p = str;\n");
+    try expectRender("pragma s.p = 'a b'", "PRAGMA s.p = \"a b\";\n");
+    try expectRender("pragma pragma = left", "PRAGMA \"pragma\" = \"left\";\n");
+    try expectRender("explain pragma p; explain query plan pragma p=1", "EXPLAIN PRAGMA p;\nEXPLAIN QUERY PLAN PRAGMA p = 1;\n");
+}
+
+test "pragma errors" {
+    try expectError("pragma", "incomplete input", .{ .byte_offset = 6, .line = 1, .column = 7 });
+    try expectError("pragma;", "near \";\": syntax error", .{ .byte_offset = 6, .line = 1, .column = 7 });
+    try expectError("pragma p=", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("pragma p=-x", "near \"x\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("pragma p=+x", "near \"x\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("pragma p=-on", "near \"on\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("pragma p=--1", "incomplete input", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("pragma p=- -1", "near \"-\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("pragma p(", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("pragma p(1", "incomplete input", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("pragma p(1)2", "near \"2\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("pragma p=1 2", "near \"2\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("pragma p ==", "incomplete input", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("pragma p.", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+}
+
+test "attach and detach" {
+    try expectRender("attach 'f' as a", "ATTACH DATABASE 'f' AS a;\n");
+    try expectRender("attach database 'f' as a key 'k'", "ATTACH DATABASE 'f' AS a KEY 'k';\n");
+    try expectRender("attach x+1 as y", "ATTACH DATABASE (x + 1) AS y;\n");
+    try expectRender("attach database database as x", "ATTACH DATABASE \"database\" AS x;\n");
+    try expectRender("attach 'f' as a key key", "ATTACH DATABASE 'f' AS a KEY \"key\";\n");
+    try expectRender("detach a", "DETACH DATABASE a;\n");
+    try expectRender("detach database a", "DETACH DATABASE a;\n");
+    try expectRender("detach database database", "DETACH DATABASE \"database\";\n");
+    try expectRender("explain detach 'x'", "EXPLAIN DETACH DATABASE 'x';\n");
+}
+
+test "attach and detach errors" {
+    try expectError("attach 'f'", "incomplete input", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("attach 'f' as", "incomplete input", .{ .byte_offset = 13, .line = 1, .column = 14 });
+    try expectError("attach 'f' a", "near \"a\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("attach database as x", "near \"as\": syntax error", .{ .byte_offset = 16, .line = 1, .column = 17 });
+    try expectError("detach", "incomplete input", .{ .byte_offset = 6, .line = 1, .column = 7 });
+    try expectError("detach database", "incomplete input", .{ .byte_offset = 15, .line = 1, .column = 16 });
+}
+
+test "vacuum, reindex and analyze" {
+    try expectRender("vacuum", "VACUUM;\n");
+    try expectRender("vacuum m", "VACUUM m;\n");
+    try expectRender("vacuum into 'f'", "VACUUM INTO 'f';\n");
+    try expectRender("vacuum m into 'f'", "VACUUM m INTO 'f';\n");
+    try expectRender("vacuum vacuum", "VACUUM \"vacuum\";\n");
+    try expectRender("reindex", "REINDEX;\n");
+    try expectRender("reindex t", "REINDEX t;\n");
+    try expectRender("reindex s.t", "REINDEX s.t;\n");
+    try expectRender("reindex left", "REINDEX \"left\";\n");
+    try expectRender("analyze", "ANALYZE;\n");
+    try expectRender("analyze t", "ANALYZE t;\n");
+    try expectRender("analyze s.t", "ANALYZE s.t;\n");
+    try expectRender("analyze analyze", "ANALYZE \"analyze\";\n");
+    try expectRender("explain vacuum; explain query plan analyze t", "EXPLAIN VACUUM;\nEXPLAIN QUERY PLAN ANALYZE t;\n");
+}
+
+test "vacuum, reindex and analyze errors" {
+    try expectError("vacuum into", "incomplete input", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("vacuum into into 1", "near \"into\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("vacuum a b", "near \"b\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("reindex a.", "incomplete input", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("reindex a.b.c", "near \".\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("analyze 1", "near \"1\": syntax error", .{ .byte_offset = 8, .line = 1, .column = 9 });
 }

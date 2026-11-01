@@ -9,6 +9,33 @@ const oracle = @import("oracle.zig");
 
 const buffer_size = 64 * 1024;
 
+/// Functions whose result can change from one evaluation to the next. Running a
+/// statement twice cannot rule them out: `randomblob(0) - 1` gives the same answer
+/// most of the time.
+const nondeterministic_functions = std.StaticStringMap(void).initComptime(.{
+    .{"random"}, .{"randomblob"}, .{"changes"}, .{"total_changes"},
+});
+
+/// Whether `sql` calls a non-deterministic function or reads the clock.
+fn isNondeterministic(arena: std.mem.Allocator, sql: []const u8) !bool {
+    const source = try arena.dupeSentinel(u8, sql, 0);
+    var t: sqlite_parser.tokenizer.Tokenizer = .init(source);
+    while (true) {
+        const token = t.next();
+        const text = source[token.loc.start..token.loc.end];
+        switch (token.tag) {
+            .eof => return false,
+            .keyword_ctime_kw => return true,
+            .identifier => {
+                var buf: [16]u8 = undefined;
+                if (text.len <= buf.len and nondeterministic_functions.has(std.ascii.lowerString(&buf, text))) return true;
+            },
+            .string_literal => if (std.ascii.findIgnoreCase(text, "now") != null) return true,
+            else => {},
+        }
+    }
+}
+
 const Comparison = enum { compared, skipped, mismatch };
 
 fn sameEvaluation(a: oracle.Evaluation, b: oracle.Evaluation) bool {
@@ -20,8 +47,10 @@ fn sameEvaluation(a: oracle.Evaluation, b: oracle.Evaluation) bool {
 }
 
 /// Evaluates `sql` and our rendering of it. Statements SQLite refuses to run, that
-/// we do not parse, or whose result changes between two runs are skipped.
+/// we do not parse, that call a non-deterministic function, or whose result changes
+/// between two runs are skipped.
 fn sameRows(arena: std.mem.Allocator, sql: []const u8) !Comparison {
+    if (try isNondeterministic(arena, sql)) return .skipped;
     const first = oracle.eval(sql, try arena.alloc(u8, buffer_size));
     if (first == .refused) return .skipped;
     if (!sameEvaluation(first, oracle.eval(sql, try arena.alloc(u8, buffer_size)))) return .skipped;
@@ -72,6 +101,17 @@ const binary_operators = [_][]const u8{
     "IS", "IS NOT", "IS DISTINCT FROM", "IS NOT DISTINCT FROM",
 };
 const prefix_operators = [_][]const u8{ "-", "+", "~", "NOT" };
+test isNondeterministic {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect(try isNondeterministic(arena, "SELECT randomblob(0) - 1;"));
+    try std.testing.expect(try isNondeterministic(arena, "SELECT RANDOM()"));
+    try std.testing.expect(try isNondeterministic(arena, "SELECT current_timestamp"));
+    try std.testing.expect(try isNondeterministic(arena, "SELECT date('NOW')"));
+    try std.testing.expect(!try isNondeterministic(arena, "SELECT abs(-1), 'x'"));
+}
+
 const integers = [_][]const u8{
     "0",                    "1",                   "2",          "3",   "7",                   "-1",
     "255",                  "-256",                "2147483648", "-65", "9223372036854775807", "9223372036854775808",

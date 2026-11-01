@@ -87,7 +87,7 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     defer p.leave();
     const first = p.peek();
     switch (first) {
-        .keyword_select, .keyword_values => return p.parseSelectStatement(),
+        .keyword_select, .keyword_values, .keyword_with => return p.parseSelectStatement(),
         // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
         // recognized so far; every statement CREATE can start is still rejected there.
         .keyword_create => {
@@ -125,9 +125,60 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     return p.addNode(.{ .tag = tag, .main_token = main_token, .data = data });
 }
 
+/// `select ::= WITH [RECURSIVE] wqlist selectnowith | selectnowith`.
+fn parseSelectStatement(p: *Parse) Error!Node.Index {
+    if (p.peek() != .keyword_with) return p.parseSelectNoWith();
+    try p.enter();
+    defer p.leave();
+    const with = p.nextToken();
+    const recursive = p.eat(.keyword_recursive);
+    var ctes: std.ArrayList(u32) = .empty;
+    defer ctes.deinit(p.gpa);
+    try ctes.appendSlice(p.gpa, &.{ @intFromBool(recursive), 0 });
+    while (true) {
+        try ctes.append(p.gpa, @backingInt(try p.parseCte()));
+        if (!p.eat(.comma)) break;
+    }
+    ctes.items[1] = @intCast(ctes.items.len - 2);
+    const query = try p.parseSelectNoWith();
+    return p.addBinary(.with_clause, with, @fromBackingInt(try p.addExtra(ctes.items)), @backingInt(query));
+}
+
+/// `wqitem ::= nm eidlist_opt wqas LP select RP`.
+fn parseCte(p: *Parse) Error!Node.Index {
+    const name: TokenIndex = @fromBackingInt(try p.parseName(.nm));
+    var record: std.ArrayList(u32) = .empty;
+    defer record.deinit(p.gpa);
+    try record.appendSlice(p.gpa, &.{ @backingInt(Node.Materialized.any), 0 });
+    if (p.eat(.l_paren)) {
+        while (true) {
+            try record.append(p.gpa, try p.parseName(.nm));
+            const decorated = p.eat(.keyword_collate);
+            if (decorated) _ = try p.parseName(.ids);
+            if (p.eat(.keyword_asc) or p.eat(.keyword_desc) or decorated) {
+                p.deferError(.{ .tag = .syntax_error_after_column_name, .token = @fromBackingInt(p.tok_i) });
+            }
+            if (!p.eat(.comma)) break;
+        }
+        if (!p.eat(.r_paren)) return p.failHere();
+        record.items[1] = @intCast(record.items.len - 2);
+    }
+    if (!p.eat(.keyword_as)) return p.failHere();
+    if (p.eat(.keyword_materialized)) {
+        record.items[0] = @backingInt(Node.Materialized.yes);
+    } else if (p.eat(.keyword_not)) {
+        if (!p.eat(.keyword_materialized)) return p.failHere();
+        record.items[0] = @backingInt(Node.Materialized.no);
+    }
+    if (!p.eat(.l_paren)) return p.failHere();
+    const query = try p.parseSelectStatement();
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addBinary(.cte, name, query, try p.addExtra(record.items));
+}
+
 /// `selectnowith ::= oneselect | selectnowith multiselect_op oneselect`. Terms combine
 /// from the left.
-fn parseSelectStatement(p: *Parse) Error!Node.Index {
+fn parseSelectNoWith(p: *Parse) Error!Node.Index {
     var term = try p.parseOneSelect();
     var lhs = term.node;
     var misplaced: ?Ast.Error = null;
@@ -146,7 +197,7 @@ fn parseSelectStatement(p: *Parse) Error!Node.Index {
     return lhs;
 }
 
-/// `oneselect`, without the window clause, and the clause that a following compound
+/// `oneselect` and the clause that a following compound
 /// operator would misplace.
 const OneSelect = struct { node: Node.Index, clause: ?Ast.Error.Tag };
 
@@ -164,6 +215,7 @@ fn parseOneSelect(p: *Parse) Error!OneSelect {
         break :group try p.parseCommaList(parseWholeExpr);
     } else Node.Data{ .lhs = 0, .rhs = 0 };
     const having = if (p.eat(.keyword_having)) try p.parseExpr(0) else null;
+    const windows = if (p.eat(.keyword_window)) try p.parseCommaList(parseWindowDefn) else Node.Data{ .lhs = 0, .rhs = 0 };
     const order = if (p.eat(.keyword_order)) order: {
         if (!p.eat(.keyword_by)) return p.failHere();
         break :order try p.parseCommaList(parseOrderItem);
@@ -193,6 +245,8 @@ fn parseOneSelect(p: *Parse) Error!OneSelect {
         .order_end = order.rhs,
         .limit = optionalIndex(limit),
         .offset = optionalIndex(offset),
+        .window_start = windows.lhs,
+        .window_end = windows.rhs,
     };
     const node = try p.addNode(.{
         .tag = .select,
@@ -314,7 +368,7 @@ fn parseParenthesizedFrom(p: *Parse) Error!Node.Index {
     defer p.leave();
     const open = p.nextToken();
     const inner = switch (p.peek()) {
-        .keyword_select, .keyword_values => try p.parseSelectStatement(),
+        .keyword_select, .keyword_values, .keyword_with => try p.parseSelectStatement(),
         else => try p.parseFrom(),
     };
     if (!p.eat(.r_paren)) return p.failHere();
@@ -654,7 +708,7 @@ fn parseNegatable(p: *Parse, lhs: Node.Index) Error!Node.Index {
 }
 
 fn isQueryStart(tag: Token.Tag) bool {
-    return tag == .keyword_select or tag == .keyword_values;
+    return tag == .keyword_select or tag == .keyword_values or tag == .keyword_with;
 }
 
 /// What follows `IN`: `(exprlist)`, `name`, `schema.name` or either name with a
@@ -847,7 +901,7 @@ fn parseCall(p: *Parse) Error!Node.Index {
     _ = p.nextToken();
     if (p.eat(.star)) {
         if (!p.eat(.r_paren)) return p.failHere();
-        return p.addNode(.{ .tag = .call_star, .main_token = name, .data = .{ .lhs = 0, .rhs = 0 } });
+        return p.addNode(.{ .tag = .call_star, .main_token = name, .data = .{ .lhs = 0, .rhs = try p.parseFilterOver() } });
     }
     const quantifier: u32 = if (p.eat(.keyword_distinct))
         Node.call_distinct
@@ -873,8 +927,120 @@ fn parseCall(p: *Parse) Error!Node.Index {
     return p.addNode(.{
         .tag = .call,
         .main_token = name,
-        .data = .{ .lhs = try p.addExtra(parts.items), .rhs = 0 },
+        .data = .{ .lhs = try p.addExtra(parts.items), .rhs = try p.parseFilterOver() },
     });
+}
+
+/// `filter_over`, which may be empty: the `filter_over` node, or 0.
+fn parseFilterOver(p: *Parse) Error!u32 {
+    const first: TokenIndex = @fromBackingInt(p.tok_i);
+    var filter: u32 = 0;
+    if (p.eat(.keyword_filter)) {
+        if (!p.eat(.l_paren) or !p.eat(.keyword_where)) return p.failHere();
+        filter = @backingInt(try p.parseExpr(0));
+        if (!p.eat(.r_paren)) return p.failHere();
+    }
+    var over: u32 = 0;
+    if (p.eat(.keyword_over)) {
+        if (p.peek() == .l_paren) {
+            over = @backingInt(try p.parseWindow());
+        } else {
+            const name = try p.parseName(.nm);
+            over = @backingInt(try p.addNode(.{ .tag = .window_ref, .main_token = @fromBackingInt(name), .data = .{ .lhs = 0, .rhs = 0 } }));
+        }
+    }
+    if (filter == 0 and over == 0) return 0;
+    return @backingInt(try p.addNode(.{ .tag = .filter_over, .main_token = first, .data = .{ .lhs = filter, .rhs = over } }));
+}
+
+/// `windowdefn ::= nm AS LP window RP`.
+fn parseWindowDefn(p: *Parse) Error!Node.Index {
+    const name = p.tok_i;
+    _ = try p.parseName(.nm);
+    if (!p.eat(.keyword_as)) return p.failHere();
+    if (p.peek() != .l_paren) return p.failHere();
+    const window = try p.parseWindow();
+    p.nodes.items(.main_token)[@backingInt(window)] = @fromBackingInt(name);
+    return window;
+}
+
+/// `LP window RP`, at the left parenthesis.
+fn parseWindow(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    const open = p.nextToken();
+    var w: Node.Window = std.mem.zeroes(Node.Window);
+    // PARTITION, RANGE, ROWS and GROUPS begin the rules that follow, so they are not a base name.
+    switch (p.peek()) {
+        .keyword_partition, .keyword_range, .keyword_rows, .keyword_groups => {},
+        else => if (p.acceptName(.nm)) |base| {
+            w.base = @backingInt(base);
+        },
+    }
+    if (p.eat(.keyword_partition)) {
+        if (!p.eat(.keyword_by)) return p.failHere();
+        const list = try p.parseCommaList(parseWholeExpr);
+        w.partition_start = list.lhs;
+        w.partition_end = list.rhs;
+    }
+    if (p.eat(.keyword_order)) {
+        if (!p.eat(.keyword_by)) return p.failHere();
+        const list = try p.parseCommaList(parseOrderItem);
+        w.order_start = list.lhs;
+        w.order_end = list.rhs;
+    }
+    switch (p.peek()) {
+        .keyword_range, .keyword_rows, .keyword_groups => try p.parseFrame(&w),
+        else => {},
+    }
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addNode(.{ .tag = .window_def, .main_token = open, .data = .{ .lhs = try p.addExtra(@ptrCast(&w)), .rhs = 0 } });
+}
+
+/// `frame_opt` after `range_or_rows`, at that keyword: fills in the frame fields of `w`.
+fn parseFrame(p: *Parse, w: *Node.Window) Error!void {
+    w.frame_unit = @backingInt(p.nextToken());
+    if (p.eat(.keyword_between)) {
+        w.start, w.start_expr = try p.parseFrameBound(.unbounded_preceding);
+        if (!p.eat(.keyword_and)) return p.failHere();
+        w.end, w.end_expr = try p.parseFrameBound(.unbounded_following);
+    } else {
+        w.start, w.start_expr = try p.parseFrameBound(.unbounded_preceding);
+    }
+    if (p.eat(.keyword_exclude)) {
+        w.exclude = if (p.eat(.keyword_no))
+            if (p.eat(.keyword_others)) .no_others else return p.failHere()
+        else if (p.eat(.keyword_current))
+            if (p.eat(.keyword_row)) .current_row else return p.failHere()
+        else if (p.eat(.keyword_group))
+            .group
+        else if (p.eat(.keyword_ties))
+            .ties
+        else
+            return p.failHere();
+    }
+}
+
+/// `frame_bound_s` or `frame_bound_e`: `unbounded` is the only `UNBOUNDED` form the
+/// caller's bound admits. Returns the bound and its expression, 0 when it has none.
+fn parseFrameBound(p: *Parse, unbounded: Node.FrameBound) Error!struct { Node.FrameBound, u32 } {
+    if (p.eat(.keyword_unbounded)) {
+        const direction: Token.Tag = if (unbounded == .unbounded_preceding) .keyword_preceding else .keyword_following;
+        if (!p.eat(direction)) return p.failHere();
+        return .{ unbounded, 0 };
+    }
+    if (p.eat(.keyword_current)) {
+        if (!p.eat(.keyword_row)) return p.failHere();
+        return .{ .current_row, 0 };
+    }
+    const expr = try p.parseExpr(0);
+    const bound: Node.FrameBound = if (p.eat(.keyword_preceding))
+        .preceding
+    else if (p.eat(.keyword_following))
+        .following
+    else
+        return p.failHere();
+    return .{ bound, @backingInt(expr) };
 }
 
 /// `expr sortorder nulls`.

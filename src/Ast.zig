@@ -2794,3 +2794,66 @@ test "CREATE VIRTUAL TABLE errors" {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
     }
 }
+
+test "CREATE TRIGGER" {
+    const cases = [_][2][:0]const u8{
+        .{ "create trigger tr before delete on t begin select 1; end", "CREATE TRIGGER tr BEFORE DELETE ON t BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr after insert on t begin select 1; end", "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr instead of update on v begin select 1; end", "CREATE TRIGGER tr INSTEAD OF UPDATE ON v BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr update of a, b on t begin select 1; end", "CREATE TRIGGER tr UPDATE OF a, b ON t BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr delete on t begin select 1; end;", "CREATE TRIGGER tr DELETE ON t BEGIN SELECT 1; END;\n" },
+        .{ "create temp trigger if not exists main.tr after update on main.t begin select 1; end", "CREATE TEMP TRIGGER IF NOT EXISTS main.tr AFTER UPDATE ON main.t BEGIN SELECT 1; END;\n" },
+        .{ "create trigger before before insert on after begin select 1; end", "CREATE TRIGGER \"before\" BEFORE INSERT ON \"after\" BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr after insert on t for each row begin select 1; end", "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr insert on t when new.a > 1 begin select 1; end", "CREATE TRIGGER tr INSERT ON t WHEN (new.a > 1) BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr after insert on t for each row when new.a begin select 1; end", "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW WHEN new.a BEGIN SELECT 1; END;\n" },
+        .{ "create trigger tr insert on t begin select 1; select 2; delete from t; end", "CREATE TRIGGER tr INSERT ON t BEGIN SELECT 1; SELECT 2; DELETE FROM t; END;\n" },
+        .{
+            "create trigger tr insert on t begin update or replace u set a = 1, b = new.b from v where u.id = v.id; end",
+            "CREATE TRIGGER tr INSERT ON t BEGIN UPDATE OR REPLACE u SET a = 1, b = new.b FROM v WHERE (u.id = v.id); END;\n",
+        },
+        .{ "create trigger tr insert on t begin insert into u(a, b) select 1, 2; end", "CREATE TRIGGER tr INSERT ON t BEGIN INSERT INTO u (a, b) SELECT 1, 2; END;\n" },
+        .{ "create trigger tr insert on t begin replace into u values (1), (2); end", "CREATE TRIGGER tr INSERT ON t BEGIN REPLACE INTO u VALUES (1), (2); END;\n" },
+        .{ "create trigger tr insert on t begin insert or ignore into u values (1) on conflict do nothing; end", "CREATE TRIGGER tr INSERT ON t BEGIN INSERT OR IGNORE INTO u VALUES (1) ON CONFLICT DO NOTHING; END;\n" },
+        .{ "create trigger tr insert on t begin delete from u where a = old.a; end", "CREATE TRIGGER tr INSERT ON t BEGIN DELETE FROM u WHERE (a = old.a); END;\n" },
+        .{ "create trigger tr insert on t begin with x as (select 1) select * from x; end", "CREATE TRIGGER tr INSERT ON t BEGIN WITH x AS (SELECT 1) SELECT * FROM x; END;\n" },
+        .{ "create trigger tr insert on t begin select raise(ignore); end", "CREATE TRIGGER tr INSERT ON t BEGIN SELECT RAISE(IGNORE); END;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE TRIGGER errors" {
+    const qualified = "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers";
+    const indexed_by = "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers";
+    const not_indexed = "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers";
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE a.b SET x = 1; END", qualified, 53 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO a.b SELECT 1; END", qualified, 58 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM a.b WHERE x; END", qualified, 58 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t INDEXED BY i SET x = 1; END", indexed_by, 64 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t NOT INDEXED SET x = 1; END", not_indexed, 63 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t INDEXED BY i; END", indexed_by, 68 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t NOT INDEXED; END", not_indexed, 67 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t RETURNING x; END", "near \"RETURNING\": syntax error", 56 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET x = 1 RETURNING x; END", "near \"RETURNING\": syntax error", 61 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t SELECT 1 RETURNING x; END", "near \"RETURNING\": syntax error", 65 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c; END", "near \"INSERT\": syntax error", 63 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN WITH c AS (SELECT 1) UPDATE t SET x = 1; END", "near \"UPDATE\": syntax error", 63 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN WITH c AS (SELECT 1) DELETE FROM t; END", "near \"DELETE\": syntax error", 63 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET x = 1 ORDER BY x; END", "near \"ORDER\": syntax error", 61 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET x = 1 LIMIT 1; END", "near \"LIMIT\": syntax error", 61 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t ORDER BY x; END", "near \"ORDER\": syntax error", 56 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t LIMIT 1; END", "near \"LIMIT\": syntax error", 56 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t DEFAULT VALUES; END", "near \"DEFAULT\": syntax error", 56 },
+        .{ "CREATE TRIGGER tr INSTEAD INSERT ON t BEGIN SELECT 1; END", "near \"INSERT\": syntax error", 26 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t AS x BEGIN SELECT 1; END", "near \"AS\": syntax error", 36 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; ", "incomplete input", 52 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1", "incomplete input", 50 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t END", "near \"END\": syntax error", 56 },
+        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN END", "near \"END\": syntax error", 42 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+}

@@ -36,7 +36,7 @@ pub const Family = enum {
 };
 
 /// The families whose statements the differential tests check.
-const implemented = [_]Family{ .empty, .transaction, .other, .select_expressions };
+const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions };
 
 fn isImplemented(family: Family) bool {
     return std.mem.indexOfScalar(Family, &implemented, family) != null;
@@ -63,9 +63,9 @@ pub fn familyOf(statement: [:0]const u8) Family {
         .keyword_savepoint,
         .keyword_release,
         => .transaction,
-        .keyword_pragma => .pragma,
-        .keyword_attach, .keyword_detach => .attach,
-        .keyword_vacuum, .keyword_reindex, .keyword_analyze => .maintenance,
+        .keyword_pragma => utilityFamily(&t, .pragma),
+        .keyword_attach, .keyword_detach => utilityFamily(&t, .attach),
+        .keyword_vacuum, .keyword_reindex, .keyword_analyze => utilityFamily(&t, .maintenance),
         .keyword_select, .keyword_values => selectFamily(&t, first.tag),
         .keyword_with => withFamily(&t),
         .keyword_insert, .keyword_replace => .insert,
@@ -76,6 +76,18 @@ pub fn familyOf(statement: [:0]const u8) Family {
         .keyword_drop => .drop,
         else => .other,
     };
+}
+
+/// A utility statement whose expression holds a subquery depends on the SELECT grammar, so
+/// it is checked with the `select` family rather than its own.
+fn utilityFamily(t: *Tokenizer, family: Family) Family {
+    while (true) {
+        switch (t.next().tag) {
+            .eof => return family,
+            .keyword_select, .keyword_values, .keyword_exists => return .select,
+            else => {},
+        }
+    }
 }
 
 fn selectFamily(t: *Tokenizer, first: Tag) Family {

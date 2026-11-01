@@ -162,11 +162,7 @@ fn parseInsert(p: *Parse) Error!Node.Index {
     const first = p.nextToken();
     var record: Node.Insert = std.mem.zeroes(Node.Insert);
     if (p.token_tags[@backingInt(first)] == .keyword_insert and p.eat(.keyword_or)) {
-        switch (p.peek()) {
-            .keyword_rollback, .keyword_abort, .keyword_fail, .keyword_ignore, .keyword_replace => {},
-            else => return p.failHere(),
-        }
-        record.conflict = @backingInt(p.nextToken());
+        record.conflict = try p.parseResolveType();
     }
     if (!p.eat(.keyword_into)) return p.failHere();
     record.table = try p.parseName(.nm);
@@ -175,18 +171,7 @@ fn parseInsert(p: *Parse) Error!Node.Index {
         record.table = try p.parseName(.nm);
     }
     if (p.eat(.keyword_as)) record.alias = try p.parseName(.nm);
-    if (p.eat(.l_paren)) {
-        var columns: std.ArrayList(u32) = .empty;
-        defer columns.deinit(p.gpa);
-        while (true) {
-            try columns.append(p.gpa, try p.parseName(.nm));
-            if (!p.eat(.comma)) break;
-        }
-        if (!p.eat(.r_paren)) return p.failHere();
-        const range = try p.addExtraRange(columns.items);
-        record.columns_start = range.lhs;
-        record.columns_end = range.rhs;
-    }
+    try p.parseInsertColumns(&record);
     var source: u32 = 0;
     if (p.eat(.keyword_default)) {
         if (!p.eat(.keyword_values)) return p.failHere();
@@ -199,6 +184,35 @@ fn parseInsert(p: *Parse) Error!Node.Index {
     record.returning_start = returning.lhs;
     record.returning_end = returning.rhs;
     return p.addInsert(first, record, source);
+}
+
+/// `resolvetype` after `OR`: the keyword token.
+fn parseResolveType(p: *Parse) Error!u32 {
+    switch (p.peek()) {
+        .keyword_rollback, .keyword_abort, .keyword_fail, .keyword_ignore, .keyword_replace => {},
+        else => return p.failHere(),
+    }
+    return @backingInt(p.nextToken());
+}
+
+/// `idlist`, stored as a range of `extra_data`.
+fn parseIdlist(p: *Parse) Error!Node.Data {
+    var names: std.ArrayList(u32) = .empty;
+    defer names.deinit(p.gpa);
+    while (true) {
+        try names.append(p.gpa, try p.parseName(.nm));
+        if (!p.eat(.comma)) break;
+    }
+    return p.addExtraRange(names.items);
+}
+
+/// `idlist_opt` into the column range of `record`.
+fn parseInsertColumns(p: *Parse, record: *Node.Insert) Error!void {
+    if (!p.eat(.l_paren)) return;
+    const columns = try p.parseIdlist();
+    if (!p.eat(.r_paren)) return p.failHere();
+    record.columns_start = columns.lhs;
+    record.columns_end = columns.rhs;
 }
 
 fn addInsert(p: *Parse, first: TokenIndex, record: Node.Insert, source: u32) Error!Node.Index {
@@ -222,13 +236,7 @@ fn parseUpdate(p: *Parse) Error!Node.Index {
     defer p.leave();
     const first = p.nextToken();
     var record: Node.Update = std.mem.zeroes(Node.Update);
-    if (p.eat(.keyword_or)) {
-        switch (p.peek()) {
-            .keyword_rollback, .keyword_abort, .keyword_fail, .keyword_ignore, .keyword_replace => {},
-            else => return p.failHere(),
-        }
-        record.conflict = @backingInt(p.nextToken());
-    }
+    if (p.eat(.keyword_or)) record.conflict = try p.parseResolveType();
     try p.parseTarget(&record);
     if (!p.eat(.keyword_set)) return p.failHere();
     const set = try p.parseCommaList(parseSetItem);
@@ -511,10 +519,168 @@ fn parseCreate(p: *Parse) Error!Node.Index {
     const temp = p.eat(.keyword_temp);
     const unique = !temp and p.eat(.keyword_unique);
     if (p.peek() == .keyword_index and !temp) return p.parseCreateIndex(create, unique);
+    if (p.peek() == .keyword_trigger and !unique) return p.parseCreateTrigger(create, temp);
     if (p.peek() == .keyword_view and !unique) return p.parseCreateView(create, temp);
     if (p.peek() == .keyword_virtual and !temp and !unique) return p.parseCreateVirtualTable(create);
     if (unique or !p.eat(.keyword_table)) return p.failHere();
     return p.parseCreateTable(create, temp);
+}
+
+/// `TRIGGER ifnotexists nm dbnm trigger_time trigger_event ON fullname foreach_clause
+/// when_clause BEGIN trigger_cmd_list END`, after `CREATE [TEMP]`.
+fn parseCreateTrigger(p: *Parse, create: TokenIndex, temp: bool) Error!Node.Index {
+    _ = p.nextToken();
+    var record: Node.CreateTrigger = std.mem.zeroes(Node.CreateTrigger);
+    record.flags.temp = temp;
+    if (p.eat(.keyword_if)) {
+        if (!p.eat(.keyword_not) or !p.eat(.keyword_exists)) return p.failHere();
+        record.flags.if_not_exists = true;
+    }
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    switch (p.peek()) {
+        .keyword_before => record.time = .before,
+        .keyword_after => record.time = .after,
+        .keyword_instead => record.time = .instead_of,
+        else => {},
+    }
+    if (record.time != .none) {
+        const time = p.nextToken();
+        if (p.token_tags[@backingInt(time)] == .keyword_instead and !p.eat(.keyword_of)) return p.failHere();
+    }
+    record.event = switch (p.peek()) {
+        .keyword_delete => .delete,
+        .keyword_insert => .insert,
+        .keyword_update => .update,
+        else => return p.failHere(),
+    };
+    _ = p.nextToken();
+    if (record.event == .update and p.eat(.keyword_of)) {
+        const columns = try p.parseIdlist();
+        record.columns_start = columns.lhs;
+        record.columns_end = columns.rhs;
+    }
+    if (!p.eat(.keyword_on)) return p.failHere();
+    record.table = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.table_schema = record.table;
+        record.table = try p.parseName(.nm);
+    }
+    if (p.eat(.keyword_for)) {
+        if (!p.eat(.keyword_each) or !p.eat(.keyword_row)) return p.failHere();
+        record.flags.for_each_row = true;
+    }
+    if (p.eat(.keyword_when)) record.when = @backingInt(try p.parseExpr(0));
+    if (!p.eat(.keyword_begin)) return p.failHere();
+    var body: std.ArrayList(u32) = .empty;
+    defer body.deinit(p.gpa);
+    while (true) {
+        try body.append(p.gpa, @backingInt(try p.parseTriggerCmd()));
+        if (!p.eat(.semicolon)) return p.failHere();
+        if (p.eat(.keyword_end)) break;
+    }
+    const range = try p.addExtraRange(body.items);
+    record.body_start = range.lhs;
+    record.body_end = range.rhs;
+    return p.addNode(.{
+        .tag = .create_trigger,
+        .main_token = create,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+/// `trigger_cmd`: the UPDATE, INSERT, DELETE and SELECT forms that triggers allow. They
+/// leave the fields their rules cannot produce at 0.
+fn parseTriggerCmd(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    return switch (p.peek()) {
+        .keyword_select, .keyword_values, .keyword_with => p.parseSelectStatement(),
+        .keyword_insert, .keyword_replace => p.parseTriggerInsert(),
+        .keyword_update => p.parseTriggerUpdate(),
+        .keyword_delete => p.parseTriggerDelete(),
+        else => p.failHere(),
+    };
+}
+
+fn parseTriggerInsert(p: *Parse) Error!Node.Index {
+    const first = p.nextToken();
+    var record: Node.Insert = std.mem.zeroes(Node.Insert);
+    if (p.token_tags[@backingInt(first)] == .keyword_insert and p.eat(.keyword_or)) {
+        record.conflict = try p.parseResolveType();
+    }
+    if (!p.eat(.keyword_into)) return p.failHere();
+    record.table = try p.parseTriggerTable();
+    try p.parseInsertColumns(&record);
+    const source = try p.parseSelectStatement();
+    record.upsert = try p.parseUpsert(&record);
+    return p.addInsert(first, record, @backingInt(source));
+}
+
+fn parseTriggerUpdate(p: *Parse) Error!Node.Index {
+    const first = p.nextToken();
+    var record: Node.Update = std.mem.zeroes(Node.Update);
+    if (p.eat(.keyword_or)) record.conflict = try p.parseResolveType();
+    record.table = try p.parseTriggerTable();
+    try p.parseTriggerIndexed();
+    if (!p.eat(.keyword_set)) return p.failHere();
+    const set = try p.parseCommaList(parseSetItem);
+    record.set_start = set.lhs;
+    record.set_end = set.rhs;
+    if (p.eat(.keyword_from)) record.from = @backingInt(try p.parseFrom());
+    if (p.eat(.keyword_where)) record.where = @backingInt(try p.parseExpr(0));
+    return p.addNode(.{
+        .tag = .update,
+        .main_token = first,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+fn parseTriggerDelete(p: *Parse) Error!Node.Index {
+    const first = p.nextToken();
+    var record: Node.Delete = std.mem.zeroes(Node.Delete);
+    if (!p.eat(.keyword_from)) return p.failHere();
+    record.table = try p.parseTriggerTable();
+    try p.parseTriggerIndexed();
+    if (p.eat(.keyword_where)) record.where = @backingInt(try p.parseExpr(0));
+    return p.addNode(.{
+        .tag = .delete,
+        .main_token = first,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+/// `trnm ::= nm | nm DOT nm`; the qualified form is an error raised by the action, and
+/// the table is the second name.
+fn parseTriggerTable(p: *Parse) Error!u32 {
+    var table = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        table = try p.parseName(.nm);
+        p.deferError(.{ .tag = .qualified_trigger_table, .token = @fromBackingInt(p.tok_i) });
+    }
+    return table;
+}
+
+/// `tridxby`: both forms of it are errors raised by the action.
+fn parseTriggerIndexed(p: *Parse) Error!void {
+    const tag: Ast.Error.Tag = switch (p.peek()) {
+        .keyword_indexed => tag: {
+            _ = p.nextToken();
+            if (!p.eat(.keyword_by)) return p.failHere();
+            _ = try p.parseName(.nm);
+            break :tag .indexed_by_in_trigger;
+        },
+        .keyword_not => tag: {
+            _ = p.nextToken();
+            if (!p.eat(.keyword_indexed)) return p.failHere();
+            break :tag .not_indexed_in_trigger;
+        },
+        else => return,
+    };
+    p.deferError(.{ .tag = tag, .token = @fromBackingInt(p.tok_i) });
 }
 
 /// `VIEW ifnotexists nm dbnm eidlist_opt AS select`, after `CREATE [TEMP]`.

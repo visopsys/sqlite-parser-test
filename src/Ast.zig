@@ -226,6 +226,36 @@ pub const Node = struct {
         };
     };
 
+    /// The record `Tag.create_trigger` points to in `extra_data`; absent tokens and nodes are 0.
+    pub const CreateTrigger = extern struct {
+        flags: Flags,
+        time: Time,
+        event: Event,
+        schema: u32,
+        name: u32,
+        table_schema: u32,
+        table: u32,
+        /// The column name tokens of `UPDATE OF`, in `extra_data`; empty without them.
+        columns_start: u32,
+        columns_end: u32,
+        /// The `WHEN` expression.
+        when: u32,
+        /// The statement nodes of the body, in `extra_data`.
+        body_start: u32,
+        body_end: u32,
+
+        pub const Flags = packed struct(u32) {
+            temp: bool = false,
+            if_not_exists: bool = false,
+            for_each_row: bool = false,
+            _: u29 = 0,
+        };
+
+        pub const Time = enum(u32) { none, before, after, instead_of };
+
+        pub const Event = enum(u32) { delete, insert, update };
+    };
+
     /// The record `Tag.create_virtual_table` points to in `extra_data`; absent tokens are 0.
     pub const CreateVirtualTable = extern struct {
         if_not_exists: bool,
@@ -473,6 +503,11 @@ pub const Node = struct {
         /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateView`.
         /// `rhs` is the query node.
         create_view,
+        /// `CREATE [TEMP] TRIGGER [IF NOT EXISTS] [schema.]name [time] event ON [schema.]table
+        /// [FOR EACH ROW] [WHEN ..] BEGIN statements END`. `main_token` is `CREATE`. `lhs` is the
+        /// `extra_data` index of a `Node.CreateTrigger`. The body statements are `select`,
+        /// `insert`, `update` and `delete` nodes that leave what trigger bodies cannot have at 0.
+        create_trigger,
         /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] [schema.]name USING module [(args)]`.
         /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a
         /// `Node.CreateVirtualTable`.
@@ -531,6 +566,13 @@ pub const Error = struct {
         /// Blamed on the token after a `COLLATE`, `ASC` or `DESC` in a CTE column list;
         /// the message names the column.
         syntax_error_after_column_name,
+        /// `a.b` as the table of a trigger's `INSERT`, `UPDATE` or `DELETE`; blamed on the token
+        /// after the table name.
+        qualified_trigger_table,
+        /// `INDEXED BY nm` in a trigger's `UPDATE` or `DELETE`; blamed on the token after `nm`.
+        indexed_by_in_trigger,
+        /// `NOT INDEXED` in a trigger's `UPDATE` or `DELETE`; blamed on the token after it.
+        not_indexed_in_trigger,
     };
 };
 
@@ -620,6 +662,9 @@ pub fn renderError(self: Ast, err: Error, writer: *std.Io.Writer) std.Io.Writer.
             while (tags[column - 1] != .comma and tags[column - 1] != .l_paren) column -= 1;
             try writer.print("syntax error after column name \"{s}\"", .{self.tokenText(@fromBackingInt(column))});
         },
+        .qualified_trigger_table => try writer.writeAll("qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers"),
+        .indexed_by_in_trigger => try writer.writeAll("the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers"),
+        .not_indexed_in_trigger => try writer.writeAll("the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers"),
     }
 }
 
@@ -747,6 +792,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .alter_table => try self.renderAlterTable(n, writer),
         .create_index => try self.renderCreateIndex(n, writer),
         .create_view => try self.renderCreateView(n, writer),
+        .create_trigger => try self.renderCreateTrigger(n, writer),
         .create_virtual_table => try self.renderCreateVirtualTable(n, writer),
         .drop => try self.renderDrop(n, writer),
         .insert => try self.renderInsert(n, writer),
@@ -873,6 +919,47 @@ fn renderCreateView(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Er
     if (t.columns_end != t.columns_start) try writer.writeByte(')');
     try writer.writeAll(" AS ");
     try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+}
+
+fn renderCreateTrigger(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateTrigger = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateTrigger) / 4]);
+    try writer.writeAll(if (t.flags.temp) "CREATE TEMP TRIGGER " else "CREATE TRIGGER ");
+    if (t.flags.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    try writer.writeAll(switch (t.time) {
+        .none => "",
+        .before => " BEFORE",
+        .after => " AFTER",
+        .instead_of => " INSTEAD OF",
+    });
+    try writer.writeAll(switch (t.event) {
+        .delete => " DELETE",
+        .insert => " INSERT",
+        .update => " UPDATE",
+    });
+    for (self.extra_data[t.columns_start..t.columns_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " OF " else ", ");
+        try self.renderName(column, writer);
+    }
+    try writer.writeAll(" ON ");
+    if (t.table_schema != 0) {
+        try self.renderName(t.table_schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.table, writer);
+    if (t.flags.for_each_row) try writer.writeAll(" FOR EACH ROW");
+    try self.renderClause(" WHEN ", t.when, writer);
+    try writer.writeAll(" BEGIN");
+    for (self.extra_data[t.body_start..t.body_end]) |statement| {
+        try writer.writeByte(' ');
+        try self.renderStatement(@fromBackingInt(@intCast(statement)), writer);
+        try writer.writeByte(';');
+    }
+    try writer.writeAll(" END");
 }
 
 fn renderCreateVirtualTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1738,6 +1825,9 @@ test "renderError writes every tag" {
         .{ .order_by_after_union, "ORDER BY clause should come after FOO not before" },
         .{ .limit_after_union, "LIMIT clause should come after FOO not before" },
         .{ .join_clause_required, "a JOIN clause is required before FOO" },
+        .{ .qualified_trigger_table, "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers" },
+        .{ .indexed_by_in_trigger, "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers" },
+        .{ .not_indexed_in_trigger, "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers" },
     };
     for (cases) |case| {
         var buf: std.Io.Writer.Allocating = .init(gpa);
@@ -2817,6 +2907,8 @@ test "CREATE TRIGGER" {
         .{ "create trigger tr insert on t begin insert or ignore into u values (1) on conflict do nothing; end", "CREATE TRIGGER tr INSERT ON t BEGIN INSERT OR IGNORE INTO u VALUES (1) ON CONFLICT DO NOTHING; END;\n" },
         .{ "create trigger tr insert on t begin delete from u where a = old.a; end", "CREATE TRIGGER tr INSERT ON t BEGIN DELETE FROM u WHERE (a = old.a); END;\n" },
         .{ "create trigger tr insert on t begin with x as (select 1) select * from x; end", "CREATE TRIGGER tr INSERT ON t BEGIN WITH x AS (SELECT 1) SELECT * FROM x; END;\n" },
+        // parse.y's `upsert` takes RETURNING; SQLite rejects it later, as a semantic error.
+        .{ "create trigger tr insert on t begin insert into u select 1 returning a; end", "CREATE TRIGGER tr INSERT ON t BEGIN INSERT INTO u SELECT 1 RETURNING a; END;\n" },
         .{ "create trigger tr insert on t begin select raise(ignore); end", "CREATE TRIGGER tr INSERT ON t BEGIN SELECT RAISE(IGNORE); END;\n" },
     };
     for (cases) |case| try expectRender(case[0], case[1]);
@@ -2837,7 +2929,6 @@ test "CREATE TRIGGER errors" {
         .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t NOT INDEXED; END", not_indexed, 67 },
         .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t RETURNING x; END", "near \"RETURNING\": syntax error", 56 },
         .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET x = 1 RETURNING x; END", "near \"RETURNING\": syntax error", 61 },
-        .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t SELECT 1 RETURNING x; END", "near \"RETURNING\": syntax error", 65 },
         .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c; END", "near \"INSERT\": syntax error", 63 },
         .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN WITH c AS (SELECT 1) UPDATE t SET x = 1; END", "near \"UPDATE\": syntax error", 63 },
         .{ "CREATE TRIGGER tr AFTER INSERT ON t BEGIN WITH c AS (SELECT 1) DELETE FROM t; END", "near \"DELETE\": syntax error", 63 },

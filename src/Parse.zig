@@ -90,6 +90,8 @@ fn parseStatement(p: *Parse) Error!Node.Index {
         .keyword_select, .keyword_values => return p.parseSelectStatement(),
         .keyword_with => return p.parseWith(true),
         .keyword_insert, .keyword_replace => return p.parseInsert(),
+        .keyword_update => return p.parseUpdate(),
+        .keyword_delete => return p.parseDelete(),
         // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
         // recognized so far; every statement CREATE can start is still rejected there.
         .keyword_create => {
@@ -133,9 +135,9 @@ fn parseSelectStatement(p: *Parse) Error!Node.Index {
     return p.parseWith(false);
 }
 
-/// `with` followed by a query, or by an INSERT when `allow_insert` (only a statement
-/// can be one: `cmd ::= with insert_cmd ..`).
-fn parseWith(p: *Parse, allow_insert: bool) Error!Node.Index {
+/// `with` followed by a query, or by an INSERT, UPDATE or DELETE when `is_statement` (only
+/// a statement can be one: `cmd ::= with insert_cmd ..`).
+fn parseWith(p: *Parse, is_statement: bool) Error!Node.Index {
     try p.enter();
     defer p.leave();
     const with = p.nextToken();
@@ -148,10 +150,12 @@ fn parseWith(p: *Parse, allow_insert: bool) Error!Node.Index {
         if (!p.eat(.comma)) break;
     }
     ctes.items[1] = @intCast(ctes.items.len - 2);
-    const query = if (allow_insert and (p.peek() == .keyword_insert or p.peek() == .keyword_replace))
-        try p.parseInsert()
-    else
-        try p.parseSelectNoWith();
+    const query = if (!is_statement) try p.parseSelectNoWith() else switch (p.peek()) {
+        .keyword_insert, .keyword_replace => try p.parseInsert(),
+        .keyword_update => try p.parseUpdate(),
+        .keyword_delete => try p.parseDelete(),
+        else => try p.parseSelectNoWith(),
+    };
     return p.addBinary(.with_clause, with, @fromBackingInt(try p.addExtra(ctes.items)), @backingInt(query));
 }
 
@@ -195,7 +199,9 @@ fn parseInsert(p: *Parse) Error!Node.Index {
         record.upsert = try p.parseUpsert(&record);
         return p.addInsert(first, record, source);
     }
-    try p.parseReturning(&record);
+    const returning = try p.parseReturning();
+    record.returning_start = returning.lhs;
+    record.returning_end = returning.rhs;
     return p.addInsert(first, record, source);
 }
 
@@ -207,12 +213,104 @@ fn addInsert(p: *Parse, first: TokenIndex, record: Node.Insert, source: u32) Err
     });
 }
 
-/// `returning ::= RETURNING selcollist | `.
-fn parseReturning(p: *Parse, record: *Node.Insert) Error!void {
-    if (!p.eat(.keyword_returning)) return;
-    const columns = try p.parseCommaList(parseResultColumn);
-    record.returning_start = columns.lhs;
-    record.returning_end = columns.rhs;
+/// `returning ::= RETURNING selcollist | `, as a range of `extra_data` (empty when absent).
+fn parseReturning(p: *Parse) Error!Node.Data {
+    if (!p.eat(.keyword_returning)) return .{ .lhs = 0, .rhs = 0 };
+    return p.parseCommaList(parseResultColumn);
+}
+
+/// `cmd ::= UPDATE orconf xfullname indexed_opt SET setlist from where_opt_ret orderby_opt
+/// limit_opt`, in the `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` form.
+fn parseUpdate(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    const first = p.nextToken();
+    var record: Node.Update = std.mem.zeroes(Node.Update);
+    if (p.eat(.keyword_or)) {
+        switch (p.peek()) {
+            .keyword_rollback, .keyword_abort, .keyword_fail, .keyword_ignore, .keyword_replace => {},
+            else => return p.failHere(),
+        }
+        record.conflict = @backingInt(p.nextToken());
+    }
+    try p.parseTarget(&record);
+    if (!p.eat(.keyword_set)) return p.failHere();
+    const set = try p.parseCommaList(parseSetItem);
+    record.set_start = set.lhs;
+    record.set_end = set.rhs;
+    if (p.eat(.keyword_from)) record.from = @backingInt(try p.parseFrom());
+    try p.parseModifiers(&record);
+    return p.addNode(.{
+        .tag = .update,
+        .main_token = first,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+/// `cmd ::= DELETE FROM xfullname indexed_opt where_opt_ret orderby_opt limit_opt`, in the
+/// `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` form.
+fn parseDelete(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    const first = p.nextToken();
+    var record: Node.Delete = std.mem.zeroes(Node.Delete);
+    if (!p.eat(.keyword_from)) return p.failHere();
+    try p.parseTarget(&record);
+    try p.parseModifiers(&record);
+    return p.addNode(.{
+        .tag = .delete,
+        .main_token = first,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+/// `xfullname indexed_opt` into the `schema`, `table`, `alias` and `indexed` fields of
+/// `record`. `xfullname` is `nm [DOT nm] [AS nm]`.
+fn parseTarget(p: *Parse, record: anytype) Error!void {
+    record.table = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.table;
+        record.table = try p.parseName(.nm);
+    }
+    if (p.eat(.keyword_as)) record.alias = try p.parseName(.nm);
+    switch (p.peek()) {
+        .keyword_indexed => {
+            record.indexed = p.tok_i;
+            _ = p.nextToken();
+            if (!p.eat(.keyword_by)) return p.failHere();
+            _ = try p.parseName(.nm);
+        },
+        .keyword_not => {
+            record.indexed = p.tok_i;
+            _ = p.nextToken();
+            if (!p.eat(.keyword_indexed)) return p.failHere();
+        },
+        else => {},
+    }
+}
+
+/// `where_opt_ret orderby_opt limit_opt` into the matching fields of `record`:
+/// `WHERE expr`, `RETURNING ..`, `ORDER BY ..`, then `LIMIT expr [OFFSET expr | COMMA expr]`.
+/// The comma form puts the offset first.
+fn parseModifiers(p: *Parse, record: anytype) Error!void {
+    if (p.eat(.keyword_where)) record.where = @backingInt(try p.parseExpr(0));
+    const returning = try p.parseReturning();
+    record.returning_start = returning.lhs;
+    record.returning_end = returning.rhs;
+    if (p.eat(.keyword_order)) {
+        if (!p.eat(.keyword_by)) return p.failHere();
+        const order = try p.parseCommaList(parseOrderItem);
+        record.order_start = order.lhs;
+        record.order_end = order.rhs;
+    }
+    if (!p.eat(.keyword_limit)) return;
+    record.limit = @backingInt(try p.parseExpr(0));
+    if (p.eat(.keyword_offset)) {
+        record.offset = @backingInt(try p.parseExpr(0));
+    } else if (p.eat(.comma)) {
+        record.offset = record.limit;
+        record.limit = @backingInt(try p.parseExpr(0));
+    }
 }
 
 /// `upsert`: the first clause's node, or 0. Only a clause with a conflict target can be
@@ -249,7 +347,9 @@ fn parseUpsert(p: *Parse, record: *Node.Insert) Error!u32 {
         previous = node;
         if (!targeted) break;
     }
-    try p.parseReturning(record);
+    const returning = try p.parseReturning();
+    record.returning_start = returning.lhs;
+    record.returning_end = returning.rhs;
     return first;
 }
 

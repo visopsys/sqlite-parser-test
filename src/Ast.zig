@@ -122,6 +122,46 @@ pub const Node = struct {
         returning_end: u32,
     };
 
+    /// The record `Tag.update` points to in `extra_data`. Absent tokens, nodes and ranges
+    /// are 0, as in `Insert`.
+    pub const Update = extern struct {
+        /// The conflict resolution keyword after `OR`.
+        conflict: u32,
+        schema: u32,
+        table: u32,
+        alias: u32,
+        /// The `INDEXED` or `NOT` token of `INDEXED BY nm` or `NOT INDEXED`.
+        indexed: u32,
+        set_start: u32,
+        set_end: u32,
+        /// The `FROM` clause node, as for `Select`.
+        from: u32,
+        where: u32,
+        returning_start: u32,
+        returning_end: u32,
+        order_start: u32,
+        order_end: u32,
+        limit: u32,
+        /// The `OFFSET` expression; `LIMIT a, b` is stored as limit `b`, offset `a`.
+        offset: u32,
+    };
+
+    /// The record `Tag.delete` points to in `extra_data`; the fields are those of `Update`
+    /// that a `DELETE` has.
+    pub const Delete = extern struct {
+        schema: u32,
+        table: u32,
+        alias: u32,
+        indexed: u32,
+        where: u32,
+        returning_start: u32,
+        returning_end: u32,
+        order_start: u32,
+        order_end: u32,
+        limit: u32,
+        offset: u32,
+    };
+
     /// The record `Tag.upsert` points to in `extra_data`. Nodes absent are 0.
     pub const Upsert = extern struct {
         target_start: u32,
@@ -305,6 +345,12 @@ pub const Node = struct {
         /// `REPLACE`. `lhs` is the `extra_data` index of a `Node.Insert`. `rhs` is the query
         /// node (`select`, `compound`, `values` or `with_clause`), or 0 for `DEFAULT VALUES`.
         insert,
+        /// `UPDATE [OR conflict] ..`. `main_token` is `UPDATE`. `lhs` is the `extra_data`
+        /// index of a `Node.Update`. `rhs` is 0.
+        update,
+        /// `DELETE FROM ..`. `main_token` is `DELETE`. `lhs` is the `extra_data` index of a
+        /// `Node.Delete`. `rhs` is 0.
+        delete,
         /// One `ON CONFLICT [(target) [WHERE ..]] DO NOTHING | DO UPDATE SET ..` clause.
         /// `main_token` is `ON`. `lhs` is the `extra_data` index of a `Node.Upsert`, whose
         /// target is a range of `order_item` nodes and the settings a range of `set_item`
@@ -558,6 +604,8 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
         },
         .insert => try self.renderInsert(n, writer),
+        .update => try self.renderUpdate(n, writer),
+        .delete => try self.renderDelete(n, writer),
         .compound => {
             try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(' ');
@@ -654,6 +702,63 @@ fn renderInsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!
     }
 }
 
+fn renderUpdate(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const u: *const Node.Update = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Update) / 4]);
+    try writer.writeAll("UPDATE");
+    if (u.conflict != 0) {
+        try writer.writeAll(" OR");
+        try self.renderKeyword(u.conflict, writer);
+    }
+    try writer.writeByte(' ');
+    try self.renderTarget(u, writer);
+    for (self.extra_data[u.set_start..u.set_end], 0..) |item, i| {
+        try writer.writeAll(if (i == 0) " SET " else ", ");
+        try self.renderSetItem(@fromBackingInt(@intCast(item)), writer);
+    }
+    if (u.from != 0) {
+        try writer.writeAll(" FROM ");
+        try self.renderFrom(@fromBackingInt(@intCast(u.from)), writer);
+    }
+    try self.renderModifiers(u, writer);
+}
+
+fn renderDelete(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const d: *const Node.Delete = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Delete) / 4]);
+    try writer.writeAll("DELETE FROM ");
+    try self.renderTarget(d, writer);
+    try self.renderModifiers(d, writer);
+}
+
+/// Writes `[schema.]table [AS alias] [INDEXED BY nm | NOT INDEXED]` of an `Update` or `Delete`.
+fn renderTarget(self: Ast, record: anytype, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (record.schema != 0) {
+        try self.renderName(record.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(record.table, writer);
+    try self.renderAlias(record.alias, writer);
+    const indexed = record.indexed;
+    if (indexed == 0) return;
+    const not = self.tokens.items(.tag)[indexed] == .keyword_not;
+    try writer.writeAll(if (not) " NOT INDEXED" else " INDEXED BY ");
+    if (!not) try self.renderName(indexed + 2, writer);
+}
+
+/// Writes the `WHERE`, `RETURNING`, `ORDER BY` and `LIMIT` clauses of an `Update` or `Delete`.
+fn renderModifiers(self: Ast, record: anytype, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try self.renderClause(" WHERE ", record.where, writer);
+    for (self.extra_data[record.returning_start..record.returning_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " RETURNING " else ", ");
+        try self.renderResultColumn(@fromBackingInt(@intCast(column)), writer);
+    }
+    if (record.order_start != record.order_end) {
+        try writer.writeAll(" ORDER BY ");
+        try self.renderExprRange(record.order_start, record.order_end, writer);
+    }
+    try self.renderClause(" LIMIT ", record.limit, writer);
+    try self.renderClause(" OFFSET ", record.offset, writer);
+}
+
 fn renderUpsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     const u: *const Node.Upsert = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Upsert) / 4]);
     try writer.writeAll(" ON CONFLICT");
@@ -666,19 +771,23 @@ fn renderUpsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!
     if (u.set_start == u.set_end) return writer.writeAll(" DO NOTHING");
     for (self.extra_data[u.set_start..u.set_end], 0..) |item, i| {
         try writer.writeAll(if (i == 0) " DO UPDATE SET " else ", ");
-        const set = self.nodes.get(item);
-        const names = self.extra_data[set.data.lhs + 1 ..][0..self.extra_data[set.data.lhs]];
-        const parenthesized = self.tokens.items(.tag)[@backingInt(set.main_token)] == .l_paren;
-        if (parenthesized) try writer.writeByte('(');
-        for (names, 0..) |name, j| {
-            if (j > 0) try writer.writeAll(", ");
-            try self.renderName(name, writer);
-        }
-        if (parenthesized) try writer.writeByte(')');
-        try writer.writeAll(" = ");
-        try self.renderExpr(@fromBackingInt(@intCast(set.data.rhs)), writer);
+        try self.renderSetItem(@fromBackingInt(@intCast(item)), writer);
     }
     try self.renderClause(" WHERE ", u.set_where, writer);
+}
+
+fn renderSetItem(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const set = self.nodes.get(@backingInt(node));
+    const names = self.extra_data[set.data.lhs + 1 ..][0..self.extra_data[set.data.lhs]];
+    const parenthesized = self.tokens.items(.tag)[@backingInt(set.main_token)] == .l_paren;
+    if (parenthesized) try writer.writeByte('(');
+    for (names, 0..) |name, j| {
+        if (j > 0) try writer.writeAll(", ");
+        try self.renderName(name, writer);
+    }
+    if (parenthesized) try writer.writeByte(')');
+    try writer.writeAll(" = ");
+    try self.renderExpr(@fromBackingInt(@intCast(set.data.rhs)), writer);
 }
 
 fn renderCte(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2018,4 +2127,74 @@ test "INSERT errors" {
     for (incomplete) |source| {
         try expectError(source, "incomplete input", .{ .byte_offset = source.len, .line = 1, .column = source.len + 1 });
     }
+}
+
+test "DELETE" {
+    const cases = [_][2][:0]const u8{
+        .{ "delete from t", "DELETE FROM t;\n" },
+        .{ "delete from main.t as x where a = 1", "DELETE FROM main.t AS x WHERE (a = 1);\n" },
+        .{ "delete from t indexed by i where a", "DELETE FROM t INDEXED BY i WHERE a;\n" },
+        .{ "delete from t not indexed", "DELETE FROM t NOT INDEXED;\n" },
+        .{ "delete from t returning *, a as b", "DELETE FROM t RETURNING *, a AS b;\n" },
+        .{
+            "delete from t where a returning a order by a desc limit 1 offset 2",
+            "DELETE FROM t WHERE a RETURNING a ORDER BY a DESC LIMIT 1 OFFSET 2;\n",
+        },
+        .{ "delete from t limit 1, 2", "DELETE FROM t LIMIT 2 OFFSET 1;\n" },
+        .{ "with recursive c(x) as (select 1) delete from t where a in c", "WITH RECURSIVE c(x) AS (SELECT 1) DELETE FROM t WHERE (a IN c);\n" },
+        .{ "explain delete from t", "EXPLAIN DELETE FROM t;\n" },
+        .{ "explain query plan delete from t where a", "EXPLAIN QUERY PLAN DELETE FROM t WHERE a;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "UPDATE" {
+    const cases = [_][2][:0]const u8{
+        .{ "update t set a = 1", "UPDATE t SET a = 1;\n" },
+        .{ "update or replace t set a = 1, (b, c) = (2, 3)", "UPDATE OR REPLACE t SET a = 1, (b, c) = (2, 3);\n" },
+        .{ "update or abort t set a = 1", "UPDATE OR ABORT t SET a = 1;\n" },
+        .{ "update or fail t set a = 1", "UPDATE OR FAIL t SET a = 1;\n" },
+        .{ "update or ignore t set a = 1", "UPDATE OR IGNORE t SET a = 1;\n" },
+        .{ "update or rollback t set a = 1", "UPDATE OR ROLLBACK t SET a = 1;\n" },
+        .{
+            "update s.t as u indexed by i set a = 1 from t2 join t3 on x where y returning a order by a limit 3",
+            "UPDATE s.t AS u INDEXED BY i SET a = 1 FROM t2 JOIN t3 ON x WHERE y RETURNING a ORDER BY a LIMIT 3;\n",
+        },
+        .{ "update t not indexed set a=1", "UPDATE t NOT INDEXED SET a = 1;\n" },
+        .{ "update t set a=1 limit 1, 2", "UPDATE t SET a = 1 LIMIT 2 OFFSET 1;\n" },
+        .{ "with c as (select 1) update t set a = (select * from c)", "WITH c AS (SELECT 1) UPDATE t SET a = (SELECT * FROM c);\n" },
+        .{ "with c as (select 1) select 1", "WITH c AS (SELECT 1) SELECT 1;\n" },
+        .{ "explain update t set a = 1", "EXPLAIN UPDATE t SET a = 1;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "UPDATE and DELETE errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const syntax = [_]Case{
+        .{ "update or foo t set a=1", "near \"foo\": syntax error", 10 },
+        .{ "delete t", "near \"t\": syntax error", 7 },
+        .{ "delete from t limit 1 order by a", "near \"order\": syntax error", 22 },
+        .{ "update t set a=1 not indexed", "near \"indexed\": syntax error", 21 },
+    };
+    for (syntax) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+
+    const incomplete = [_][:0]const u8{
+        "update t",
+        "update t set",
+        "update t set a",
+        "update t set a=1 returning",
+        "delete from",
+        "delete from t where",
+        "delete from t order by",
+        "delete from t limit",
+        "with c as (select 1) update",
+    };
+    for (incomplete) |source| {
+        try expectError(source, "incomplete input", .{ .byte_offset = source.len, .line = 1, .column = source.len + 1 });
+    }
+
+    try expectError("delete from t\nlimit", "incomplete input", .{ .byte_offset = 19, .line = 2, .column = 6 });
 }

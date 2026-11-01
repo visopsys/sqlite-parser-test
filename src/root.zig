@@ -4,6 +4,8 @@
 
 const std = @import("std");
 
+pub const tokenizer = @import("tokenizer.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

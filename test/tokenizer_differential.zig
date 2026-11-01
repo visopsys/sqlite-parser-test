@@ -149,25 +149,51 @@ test "tokenizer agrees with SQLite on mutated corpus statements" {
     try std.testing.expect(count >= min_mutations);
 }
 
-fn checkStructure(_: void, smith: *std.testing.Smith) !void {
-    var raw: [257]u8 = undefined;
-    const len = smith.slice(raw[0..256]);
-    raw[len] = 0;
-    const source: [:0]const u8 = raw[0..len :0];
+/// Checks that tokenizing `source` terminates with `eof`, and that the tokens before
+/// it are non-empty, increasing, non-overlapping and inside the input.
+fn checkStructure(source: [:0]const u8) !void {
     var tokenizer: Tokenizer = .init(source);
     var end: usize = 0;
-    // Every token but eof is at least one byte, so len + 1 calls reach eof.
-    for (0..len + 1) |_| {
+    // Every token but eof is at least one byte, so source.len + 1 calls reach eof.
+    for (0..source.len + 1) |_| {
         const token = tokenizer.next();
         try std.testing.expect(token.loc.start >= end);
         try std.testing.expect(token.loc.start <= token.loc.end);
-        try std.testing.expect(token.loc.end <= len);
-        end = token.loc.end;
+        try std.testing.expect(token.loc.end <= source.len);
         if (token.tag == .eof) return;
+        try std.testing.expect(token.loc.start < token.loc.end);
+        end = token.loc.end;
     }
     return error.TestUnexpectedResult;
 }
 
+fn fuzzStructure(_: void, smith: *std.testing.Smith) !void {
+    var raw: [257]u8 = undefined;
+    const len = smith.slice(raw[0..256]);
+    raw[len] = 0;
+    try checkStructure(raw[0..len :0]);
+}
+
 test "fuzz: tokens are ordered, inside the input, and end with eof" {
-    try std.testing.fuzz({}, checkStructure, .{});
+    try std.testing.fuzz({}, fuzzStructure, .{});
+}
+
+test "tokens are ordered, inside the input, and end with eof on corpus and random bytes" {
+    const gpa = std.testing.allocator;
+    var it: corpus.Iterator = .init(corpus.sqlite_tests);
+    while (it.next()) |case| {
+        const source = try gpa.dupeSentinel(u8, case.sql, 0);
+        defer gpa.free(source);
+        try checkStructure(source);
+    }
+
+    var prng: std.Random.DefaultPrng = .init(0x7a9d_f00d);
+    const random = prng.random();
+    var raw: [257]u8 = undefined;
+    for (0..1000) |_| {
+        const len = random.uintAtMost(usize, 256);
+        random.bytes(raw[0..len]);
+        raw[len] = 0;
+        try checkStructure(raw[0..len :0]);
+    }
 }

@@ -287,7 +287,7 @@ const keyword_table = [_]struct { []const u8, Token.Tag }{
 /// The spelling of each keyword tag that has exactly one; null for shared tags
 /// (LIKE_KW, JOIN_KW, CTIME_KW, TEMP) and non-keywords.
 const keyword_lexemes = blk: {
-    const tag_count = @typeInfo(Token.Tag).@"enum".fields.len;
+    const tag_count = @typeInfo(Token.Tag).@"enum".field_names.len;
     var lexemes: [tag_count]?[]const u8 = @splat(null);
     var uses: [tag_count]usize = @splat(0);
     for (keyword_table) |entry| {
@@ -552,46 +552,442 @@ fn isIdChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '$' or c >= 0x80;
 }
 
-fn testTokenize(source: [:0]const u8, expected: []const Token.Tag) !void {
+/// The words of mkkeywordhash.c, in its spelling.
+const mkkeywordhash_words = [_][]const u8{
+    "ABORT",     "ACTION",    "ADD",          "AFTER",         "ALL",               "ALTER",       "ALWAYS",   "ANALYZE",    "AND",
+    "AS",        "ASC",       "ATTACH",       "AUTOINCREMENT", "BEFORE",            "BEGIN",       "BETWEEN",  "BY",         "CASCADE",
+    "CASE",      "CAST",      "CHECK",        "COLLATE",       "COLUMN",            "COMMIT",      "CONFLICT", "CONSTRAINT", "CREATE",
+    "CROSS",     "CURRENT",   "CURRENT_DATE", "CURRENT_TIME",  "CURRENT_TIMESTAMP", "DATABASE",    "DEFAULT",  "DEFERRED",   "DEFERRABLE",
+    "DELETE",    "DESC",      "DETACH",       "DISTINCT",      "DO",                "DROP",        "END",      "EACH",       "ELSE",
+    "ESCAPE",    "EXCEPT",    "EXCLUSIVE",    "EXCLUDE",       "EXISTS",            "EXPLAIN",     "FAIL",     "FILTER",     "FIRST",
+    "FOLLOWING", "FOR",       "FOREIGN",      "FROM",          "FULL",              "GENERATED",   "GLOB",     "GROUP",      "GROUPS",
+    "HAVING",    "IF",        "IGNORE",       "IMMEDIATE",     "IN",                "INDEX",       "INDEXED",  "INITIALLY",  "INNER",
+    "INSERT",    "INSTEAD",   "INTERSECT",    "INTO",          "IS",                "ISNULL",      "JOIN",     "KEY",        "LAST",
+    "LEFT",      "LIKE",      "LIMIT",        "MATCH",         "MATERIALIZED",      "NATURAL",     "NO",       "NOT",        "NOTHING",
+    "NOTNULL",   "NULL",      "NULLS",        "OF",            "OFFSET",            "ON",          "OR",       "ORDER",      "OTHERS",
+    "OUTER",     "OVER",      "PARTITION",    "PLAN",          "PRAGMA",            "PRECEDING",   "PRIMARY",  "QUERY",      "RAISE",
+    "RANGE",     "RECURSIVE", "REFERENCES",   "REGEXP",        "REINDEX",           "RELEASE",     "RENAME",   "REPLACE",    "RESTRICT",
+    "RETURNING", "RIGHT",     "ROLLBACK",     "ROW",           "ROWS",              "SAVEPOINT",   "SELECT",   "SET",        "TABLE",
+    "TEMP",      "TEMPORARY", "THEN",         "TIES",          "TO",                "TRANSACTION", "TRIGGER",  "UNBOUNDED",  "UNION",
+    "UNIQUE",    "UPDATE",    "USING",        "VACUUM",        "VALUES",            "VIEW",        "VIRTUAL",  "WHEN",       "WHERE",
+    "WINDOW",    "WITH",      "WITHOUT",
+};
+
+const Expected = struct { Token.Tag, []const u8 };
+
+/// Checks the tags and the source text under each `loc`, then `eof` at the end.
+fn expectTokens(source: [:0]const u8, expected: []const Expected) !void {
     var tokenizer: Tokenizer = .init(source);
-    for (expected) |tag| {
-        try std.testing.expectEqual(tag, tokenizer.next().tag);
+    var previous_end: usize = 0;
+    for (expected) |entry| {
+        const token = tokenizer.next();
+        try std.testing.expectEqual(entry[0], token.tag);
+        try std.testing.expectEqualStrings(entry[1], source[token.loc.start..token.loc.end]);
+        try std.testing.expect(token.loc.start >= previous_end);
+        previous_end = token.loc.end;
     }
     const last = tokenizer.next();
     try std.testing.expectEqual(Token.Tag.eof, last.tag);
     try std.testing.expectEqual(source.len, last.loc.start);
+    try std.testing.expectEqual(source.len, last.loc.end);
 }
 
-test "smoke" {
-    try testTokenize("SELECT 1;", &.{ .keyword_select, .integer_literal, .semicolon });
-    try testTokenize("a.b", &.{ .identifier, .dot, .identifier });
-    try testTokenize("x'AB'", &.{.blob_literal});
-    try testTokenize("  -- c\n/* c */ ", &.{});
+fn expectOne(source: [:0]const u8, tag: Token.Tag) !void {
+    try expectTokens(source, &.{.{ tag, source }});
 }
 
-test "keyword map has the words of mkkeywordhash.c" {
-    const words = [_][]const u8{
-        "ABORT",     "ACTION",    "ADD",          "AFTER",         "ALL",               "ALTER",       "ALWAYS",   "ANALYZE",    "AND",
-        "AS",        "ASC",       "ATTACH",       "AUTOINCREMENT", "BEFORE",            "BEGIN",       "BETWEEN",  "BY",         "CASCADE",
-        "CASE",      "CAST",      "CHECK",        "COLLATE",       "COLUMN",            "COMMIT",      "CONFLICT", "CONSTRAINT", "CREATE",
-        "CROSS",     "CURRENT",   "CURRENT_DATE", "CURRENT_TIME",  "CURRENT_TIMESTAMP", "DATABASE",    "DEFAULT",  "DEFERRED",   "DEFERRABLE",
-        "DELETE",    "DESC",      "DETACH",       "DISTINCT",      "DO",                "DROP",        "END",      "EACH",       "ELSE",
-        "ESCAPE",    "EXCEPT",    "EXCLUSIVE",    "EXCLUDE",       "EXISTS",            "EXPLAIN",     "FAIL",     "FILTER",     "FIRST",
-        "FOLLOWING", "FOR",       "FOREIGN",      "FROM",          "FULL",              "GENERATED",   "GLOB",     "GROUP",      "GROUPS",
-        "HAVING",    "IF",        "IGNORE",       "IMMEDIATE",     "IN",                "INDEX",       "INDEXED",  "INITIALLY",  "INNER",
-        "INSERT",    "INSTEAD",   "INTERSECT",    "INTO",          "IS",                "ISNULL",      "JOIN",     "KEY",        "LAST",
-        "LEFT",      "LIKE",      "LIMIT",        "MATCH",         "MATERIALIZED",      "NATURAL",     "NO",       "NOT",        "NOTHING",
-        "NOTNULL",   "NULL",      "NULLS",        "OF",            "OFFSET",            "ON",          "OR",       "ORDER",      "OTHERS",
-        "OUTER",     "OVER",      "PARTITION",    "PLAN",          "PRAGMA",            "PRECEDING",   "PRIMARY",  "QUERY",      "RAISE",
-        "RANGE",     "RECURSIVE", "REFERENCES",   "REGEXP",        "REINDEX",           "RELEASE",     "RENAME",   "REPLACE",    "RESTRICT",
-        "RETURNING", "RIGHT",     "ROLLBACK",     "ROW",           "ROWS",              "SAVEPOINT",   "SELECT",   "SET",        "TABLE",
-        "TEMP",      "TEMPORARY", "THEN",         "TIES",          "TO",                "TRANSACTION", "TRIGGER",  "UNBOUNDED",  "UNION",
-        "UNIQUE",    "UPDATE",    "USING",        "VACUUM",        "VALUES",            "VIEW",        "VIRTUAL",  "WHEN",       "WHERE",
-        "WINDOW",    "WITH",      "WITHOUT",
+test "keyword map has exactly the words of mkkeywordhash.c" {
+    try std.testing.expectEqual(@as(usize, 147), mkkeywordhash_words.len);
+    try std.testing.expectEqual(mkkeywordhash_words.len, keywords.kvs.len);
+    for (mkkeywordhash_words) |word| {
+        var buffer: [longest_keyword]u8 = undefined;
+        try std.testing.expect(keywords.has(std.ascii.lowerString(&buffer, word)));
+    }
+    for (keywords.keys()) |key| {
+        var buffer: [longest_keyword]u8 = undefined;
+        const upper = std.ascii.upperString(&buffer, key);
+        for (mkkeywordhash_words) |word| {
+            if (std.mem.eql(u8, word, upper)) break;
+        } else return error.KeywordNotInMkkeywordhash;
+    }
+}
+
+const CaseStyle = enum { upper, lower, upper_first, lower_first };
+
+fn withCase(buffer: *[32:0]u8, word: []const u8, style: CaseStyle) [:0]const u8 {
+    for (word, 0..) |c, i| {
+        buffer[i] = switch (style) {
+            .upper => std.ascii.toUpper(c),
+            .lower => std.ascii.toLower(c),
+            .upper_first => if (i % 2 == 0) std.ascii.toUpper(c) else std.ascii.toLower(c),
+            .lower_first => if (i % 2 == 0) std.ascii.toLower(c) else std.ascii.toUpper(c),
+        };
+    }
+    buffer[word.len] = 0;
+    return buffer[0..word.len :0];
+}
+
+/// Words whose tag is not `keyword_` plus the word, written down by hand.
+const renamed_keywords = [_]struct { []const u8, Token.Tag }{
+    .{ "autoincrement", .keyword_autoincr },
+    .{ "column", .keyword_columnkw },
+    .{ "temporary", .keyword_temp },
+    .{ "glob", .keyword_like_kw },
+    .{ "like", .keyword_like_kw },
+    .{ "regexp", .keyword_like_kw },
+    .{ "current_date", .keyword_ctime_kw },
+    .{ "current_time", .keyword_ctime_kw },
+    .{ "current_timestamp", .keyword_ctime_kw },
+    .{ "cross", .keyword_join_kw },
+    .{ "full", .keyword_join_kw },
+    .{ "inner", .keyword_join_kw },
+    .{ "left", .keyword_join_kw },
+    .{ "natural", .keyword_join_kw },
+    .{ "outer", .keyword_join_kw },
+    .{ "right", .keyword_join_kw },
+};
+
+fn expectedKeywordTag(lower: []const u8) !Token.Tag {
+    for (renamed_keywords) |entry| {
+        if (std.mem.eql(u8, entry[0], lower)) return entry[1];
+    }
+    var name_buffer: [48]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "keyword_{s}", .{lower});
+    return std.meta.stringToEnum(Token.Tag, name) orelse error.NoTagForKeyword;
+}
+
+fn isSharedTag(tag: Token.Tag) bool {
+    return switch (tag) {
+        .keyword_temp, .keyword_like_kw, .keyword_ctime_kw, .keyword_join_kw => true,
+        else => false,
     };
-    try std.testing.expectEqual(@as(usize, 147), words.len);
-    try std.testing.expectEqual(words.len, keywords.kvs.len);
-    for (words) |word| {
-        try std.testing.expect(getKeyword(word) != null);
+}
+
+test "every keyword tokenizes to its tag in every letter case" {
+    for (mkkeywordhash_words) |word| {
+        var lower_buffer: [longest_keyword]u8 = undefined;
+        const lower = std.ascii.lowerString(&lower_buffer, word);
+        const tag = try expectedKeywordTag(lower);
+        for (std.enums.values(CaseStyle)) |style| {
+            var buffer: [32:0]u8 = @splat(0);
+            const source = withCase(&buffer, word, style);
+            try expectTokens(source, &.{.{ tag, source }});
+        }
+        if (isSharedTag(tag)) {
+            try std.testing.expectEqual(@as(?[]const u8, null), tag.lexeme());
+            try std.testing.expectEqualStrings(@tagName(tag), tag.symbol());
+        } else {
+            try std.testing.expectEqualStrings(lower, tag.lexeme().?);
+            try std.testing.expectEqualStrings(lower, tag.symbol());
+        }
+    }
+}
+
+test "WINDOW, OVER and FILTER are keywords here" {
+    try expectTokens("window over filter", &.{
+        .{ .keyword_window, "window" },
+        .{ .keyword_over, "over" },
+        .{ .keyword_filter, "filter" },
+    });
+}
+
+test "keyword and identifier boundary" {
+    try expectOne("selectx", .identifier);
+    try expectOne("select1", .identifier);
+    try expectOne("select$", .identifier);
+    try expectOne("select\u{e9}", .identifier);
+    try expectOne("select_", .identifier);
+    try expectOne("current_datex", .identifier);
+    try expectOne("_select", .identifier);
+    try expectOne("selec", .identifier);
+    try expectOne("x", .identifier);
+    try expectOne("xor", .identifier);
+    try expectOne("x1", .identifier);
+    try expectTokens("select.", &.{ .{ .keyword_select, "select" }, .{ .dot, "." } });
+    try expectTokens("select(", &.{ .{ .keyword_select, "select" }, .{ .l_paren, "(" } });
+}
+
+test "whitespace" {
+    try expectTokens("", &.{});
+    try expectTokens(" \t\n\x0c\r ", &.{});
+    try expectTokens("  \t\n\x0c\r a", &.{.{ .identifier, "a" }});
+    try expectTokens("\xef\xbb\xbfa", &.{.{ .identifier, "a" }});
+    try expectTokens("a \xef\xbb\xbf b", &.{ .{ .identifier, "a" }, .{ .identifier, "b" } });
+    try expectTokens("a;\xef\xbb\xbfb", &.{ .{ .identifier, "a" }, .{ .semicolon, ";" }, .{ .identifier, "b" } });
+    try expectTokens("\xef\xbb\xbf\xef\xbb\xbf", &.{});
+}
+
+test "vertical tab starts an invalid token but continues a space run" {
+    try expectOne("\x0b", .invalid);
+    try expectTokens(" \x0b a", &.{.{ .identifier, "a" }});
+}
+
+test "a partial BOM is an identifier" {
+    try expectOne("\xef", .identifier);
+    try expectOne("\xef\xbb", .identifier);
+    try expectOne("\xef\xbbx", .identifier);
+}
+
+test "NUL ends the input" {
+    var tokenizer: Tokenizer = .init("a\x00b");
+    try std.testing.expectEqual(Token.Tag.identifier, tokenizer.next().tag);
+    for (0..2) |_| {
+        const token = tokenizer.next();
+        try std.testing.expectEqual(Token.Tag.eof, token.tag);
+        try std.testing.expectEqual(@as(usize, 1), token.loc.start);
+        try std.testing.expectEqual(@as(usize, 1), token.loc.end);
+    }
+    tokenizer = .init("\x00");
+    try std.testing.expectEqual(@as(usize, 0), tokenizer.next().loc.start);
+}
+
+test "line comments" {
+    try expectTokens("a--x\nb", &.{ .{ .identifier, "a" }, .{ .identifier, "b" } });
+    try expectTokens("a--x", &.{.{ .identifier, "a" }});
+    try expectTokens("--", &.{});
+    try expectTokens("-- a\r\n-- b\n", &.{});
+    try expectTokens("a-->b\nc", &.{ .{ .identifier, "a" }, .{ .identifier, "c" } });
+}
+
+test "block comments" {
+    try expectTokens("a/*x*/b", &.{ .{ .identifier, "a" }, .{ .identifier, "b" } });
+    try expectTokens("/**/b", &.{.{ .identifier, "b" }});
+    try expectTokens("/***/b", &.{.{ .identifier, "b" }});
+    try expectTokens("/* a * / b */c", &.{.{ .identifier, "c" }});
+    try expectTokens("a/*x", &.{.{ .identifier, "a" }});
+    try expectTokens("/*/", &.{});
+    try expectTokens("/*x*", &.{});
+    try expectTokens("/* \n\n", &.{});
+}
+
+test "slash and star when a block comment cannot start" {
+    try expectTokens("/*", &.{ .{ .slash, "/" }, .{ .star, "*" } });
+    try expectTokens("a/*", &.{ .{ .identifier, "a" }, .{ .slash, "/" }, .{ .star, "*" } });
+    try expectTokens("/ *", &.{ .{ .slash, "/" }, .{ .star, "*" } });
+    try expectTokens("/", &.{.{ .slash, "/" }});
+    try expectTokens("*/", &.{ .{ .star, "*" }, .{ .slash, "/" } });
+}
+
+test "identifiers" {
+    try expectOne("abc", .identifier);
+    try expectOne("_a", .identifier);
+    try expectOne("a_1", .identifier);
+    try expectOne("a$b", .identifier);
+    try expectOne("a$", .identifier);
+    try expectOne("\xc3\xa9", .identifier);
+    try expectOne("a\xc3\xa9b", .identifier);
+    try expectOne("\x80", .identifier);
+    try expectOne("\xff", .identifier);
+    try expectTokens("a.b", &.{ .{ .identifier, "a" }, .{ .dot, "." }, .{ .identifier, "b" } });
+}
+
+test "quoted identifiers" {
+    try expectOne("\"abc\"", .identifier);
+    try expectOne("\"a\"\"b\"", .identifier);
+    try expectOne("\"\"", .identifier);
+    try expectOne("`abc`", .identifier);
+    try expectOne("`a``b`", .identifier);
+    try expectOne("[abc]", .identifier);
+    try expectOne("[]", .identifier);
+    try expectOne("[a\"'`b]", .identifier);
+    try expectTokens("[a]b]", &.{ .{ .identifier, "[a]" }, .{ .identifier, "b" }, .{ .invalid, "]" } });
+    try expectTokens("\"a\" \"b\"", &.{ .{ .identifier, "\"a\"" }, .{ .identifier, "\"b\"" } });
+}
+
+test "unterminated quotes are invalid up to the end of input" {
+    try expectOne("\"abc", .invalid);
+    try expectOne("`abc", .invalid);
+    try expectOne("[abc", .invalid);
+    try expectOne("'abc", .invalid);
+    try expectOne("\"", .invalid);
+    try expectOne("[", .invalid);
+    try expectOne("'", .invalid);
+    try expectOne("\"a\"\"", .invalid);
+    try expectOne("'a''", .invalid);
+    try expectTokens("x \"abc", &.{ .{ .identifier, "x" }, .{ .invalid, "\"abc" } });
+}
+
+test "strings" {
+    try expectOne("'abc'", .string_literal);
+    try expectOne("''", .string_literal);
+    try expectOne("'a''b'", .string_literal);
+    try expectOne("''''", .string_literal);
+    try expectOne("'a\"b`c'", .string_literal);
+    try expectOne("'a\nb'", .string_literal);
+    try expectTokens("'a' 'b'", &.{ .{ .string_literal, "'a'" }, .{ .string_literal, "'b'" } });
+}
+
+test "blobs" {
+    try expectOne("x'AB'", .blob_literal);
+    try expectOne("X'ab01'", .blob_literal);
+    try expectOne("x''", .blob_literal);
+    try expectTokens("x'AB'c", &.{ .{ .blob_literal, "x'AB'" }, .{ .identifier, "c" } });
+}
+
+test "bad blobs are invalid" {
+    try expectOne("x'A'", .invalid);
+    try expectOne("x'ABC'", .invalid);
+    try expectOne("x'G'", .invalid);
+    try expectOne("x'AB", .invalid);
+    try expectOne("x'ABG", .invalid);
+    try expectOne("x'A", .invalid);
+    try expectOne("x'", .invalid);
+    try expectOne("x'AG12", .invalid);
+    try expectTokens("x'AG' 1", &.{ .{ .invalid, "x'AG'" }, .{ .integer_literal, "1" } });
+    try expectTokens("x'A'b", &.{ .{ .invalid, "x'A'" }, .{ .identifier, "b" } });
+}
+
+test "integers" {
+    try expectOne("0", .integer_literal);
+    try expectOne("123", .integer_literal);
+    try expectOne("0x1F", .integer_literal);
+    try expectOne("0X1f", .integer_literal);
+    try expectOne("0x0", .integer_literal);
+    // The hex branch of tokenize.c returns before the IdChar check.
+    try expectTokens("0x1g", &.{ .{ .integer_literal, "0x1" }, .{ .identifier, "g" } });
+    try expectTokens("1,2", &.{ .{ .integer_literal, "1" }, .{ .comma, "," }, .{ .integer_literal, "2" } });
+}
+
+test "floats" {
+    try expectOne("1.", .float_literal);
+    try expectOne(".5", .float_literal);
+    try expectOne("1.5", .float_literal);
+    try expectOne("1.5e10", .float_literal);
+    try expectOne("1e-3", .float_literal);
+    try expectOne("1E+3", .float_literal);
+    try expectOne("1e3", .float_literal);
+    try expectOne("1.e3", .float_literal);
+    try expectOne(".5E2", .float_literal);
+    try expectTokens("1..2", &.{ .{ .float_literal, "1." }, .{ .float_literal, ".2" } });
+    try expectTokens("a.1", &.{ .{ .identifier, "a" }, .{ .float_literal, ".1" } });
+    try expectTokens(".e1", &.{ .{ .dot, "." }, .{ .identifier, "e1" } });
+}
+
+test "a number followed by IdChars is one invalid token" {
+    try expectOne("0x", .invalid);
+    try expectOne("0xg", .invalid);
+    try expectOne("123abc", .invalid);
+    try expectOne("1.5x", .invalid);
+    try expectOne("1ex", .invalid);
+    try expectOne("1e", .invalid);
+    try expectOne("1_0", .invalid);
+    try expectOne("1$", .invalid);
+    try expectOne("1\xc3\xa9", .invalid);
+    try expectOne("1.a", .invalid);
+    try expectOne("1.5e3x", .invalid);
+    try expectTokens("1e+", &.{ .{ .invalid, "1e" }, .{ .plus, "+" } });
+    try expectTokens("1e-", &.{ .{ .invalid, "1e" }, .{ .minus, "-" } });
+    try expectTokens("12abc 3", &.{ .{ .invalid, "12abc" }, .{ .integer_literal, "3" } });
+}
+
+test "question mark variables" {
+    try expectOne("?", .variable);
+    try expectOne("?12", .variable);
+    try expectTokens("?a", &.{ .{ .variable, "?" }, .{ .identifier, "a" } });
+    try expectTokens("?1a", &.{ .{ .variable, "?1" }, .{ .identifier, "a" } });
+    try expectTokens("??", &.{ .{ .variable, "?" }, .{ .variable, "?" } });
+}
+
+test "named variables" {
+    try expectOne(":a", .variable);
+    try expectOne("@a", .variable);
+    try expectOne("$a", .variable);
+    try expectOne("#a", .variable);
+    try expectOne(":a1_$", .variable);
+    try expectOne(":\xc3\xa9", .variable);
+    try expectOne("$a::b", .variable);
+    try expectOne("$a::b(c)", .variable);
+    try expectOne("$a(b)", .variable);
+    try expectOne("$a()", .variable);
+    try expectOne("$a::", .variable);
+    try expectOne("$::a", .variable);
+    try expectTokens("$a:b", &.{ .{ .variable, "$a" }, .{ .variable, ":b" } });
+}
+
+test "bad variables are invalid" {
+    try expectOne(":", .invalid);
+    try expectOne("@", .invalid);
+    try expectOne("#", .invalid);
+    try expectOne("$", .invalid);
+    try expectOne("$::", .invalid);
+    try expectOne("$a(", .invalid);
+    try expectOne("$a(b", .invalid);
+    try expectTokens("$a(b c)", &.{ .{ .invalid, "$a(b" }, .{ .identifier, "c" }, .{ .r_paren, ")" } });
+    try expectTokens("$(a)", &.{ .{ .invalid, "$" }, .{ .l_paren, "(" }, .{ .identifier, "a" }, .{ .r_paren, ")" } });
+    try expectTokens(": a", &.{ .{ .invalid, ":" }, .{ .identifier, "a" } });
+}
+
+test "operators" {
+    try expectTokens("- + * / % = == < <= << <> != > >= >> , & ~ | || . -> ->> ( ) ;", &.{
+        .{ .minus, "-" },
+        .{ .plus, "+" },
+        .{ .star, "*" },
+        .{ .slash, "/" },
+        .{ .percent, "%" },
+        .{ .equal, "=" },
+        .{ .equal_equal, "==" },
+        .{ .l_angle_bracket, "<" },
+        .{ .angle_bracket_left_equal, "<=" },
+        .{ .angle_bracket_left_angle_bracket_left, "<<" },
+        .{ .not_equal, "<>" },
+        .{ .not_equal, "!=" },
+        .{ .r_angle_bracket, ">" },
+        .{ .angle_bracket_right_equal, ">=" },
+        .{ .angle_bracket_right_angle_bracket_right, ">>" },
+        .{ .comma, "," },
+        .{ .ampersand, "&" },
+        .{ .tilde, "~" },
+        .{ .pipe, "|" },
+        .{ .pipe_pipe, "||" },
+        .{ .dot, "." },
+        .{ .arrow, "->" },
+        .{ .arrow2, "->>" },
+        .{ .l_paren, "(" },
+        .{ .r_paren, ")" },
+        .{ .semicolon, ";" },
+    });
+}
+
+test "operators next to each other" {
+    try expectTokens("===", &.{ .{ .equal_equal, "==" }, .{ .equal, "=" } });
+    try expectTokens("=>", &.{ .{ .equal, "=" }, .{ .r_angle_bracket, ">" } });
+    try expectTokens("<<=", &.{ .{ .angle_bracket_left_angle_bracket_left, "<<" }, .{ .equal, "=" } });
+    try expectTokens(">>=", &.{ .{ .angle_bracket_right_angle_bracket_right, ">>" }, .{ .equal, "=" } });
+    try expectTokens("|||", &.{ .{ .pipe_pipe, "||" }, .{ .pipe, "|" } });
+    try expectTokens("->>>", &.{ .{ .arrow2, "->>" }, .{ .r_angle_bracket, ">" } });
+    try expectTokens("a->b", &.{ .{ .identifier, "a" }, .{ .arrow, "->" }, .{ .identifier, "b" } });
+    try expectTokens("a->>b", &.{ .{ .identifier, "a" }, .{ .arrow2, "->>" }, .{ .identifier, "b" } });
+    try expectTokens("- -", &.{ .{ .minus, "-" }, .{ .minus, "-" } });
+    try expectTokens("- >", &.{ .{ .minus, "-" }, .{ .r_angle_bracket, ">" } });
+    try expectTokens("a-", &.{ .{ .identifier, "a" }, .{ .minus, "-" } });
+    try expectTokens("<>=", &.{ .{ .not_equal, "<>" }, .{ .equal, "=" } });
+}
+
+test "illegal bytes are one-byte invalid tokens" {
+    try expectOne("!", .invalid);
+    try expectOne("^", .invalid);
+    try expectOne("\\", .invalid);
+    try expectOne("\x01", .invalid);
+    try expectOne("\x7f", .invalid);
+    try expectOne("{", .invalid);
+    try expectOne("}", .invalid);
+    try expectOne("]", .invalid);
+    try expectTokens("!!=", &.{ .{ .invalid, "!" }, .{ .not_equal, "!=" } });
+    try expectTokens("a!b", &.{ .{ .identifier, "a" }, .{ .invalid, "!" }, .{ .identifier, "b" } });
+    try expectTokens("^^", &.{ .{ .invalid, "^" }, .{ .invalid, "^" } });
+}
+
+test "a statement with exact locations" {
+    var tokenizer: Tokenizer = .init("SELECT x'0F', 1.5 -- c\n;");
+    const expected = [_]Token{
+        .{ .tag = .keyword_select, .loc = .{ .start = 0, .end = 6 } },
+        .{ .tag = .blob_literal, .loc = .{ .start = 7, .end = 12 } },
+        .{ .tag = .comma, .loc = .{ .start = 12, .end = 13 } },
+        .{ .tag = .float_literal, .loc = .{ .start = 14, .end = 17 } },
+        .{ .tag = .semicolon, .loc = .{ .start = 23, .end = 24 } },
+        .{ .tag = .eof, .loc = .{ .start = 24, .end = 24 } },
+    };
+    for (expected) |token| {
+        try std.testing.expectEqualDeep(token, tokenizer.next());
     }
 }

@@ -107,6 +107,8 @@ test "accepts valid statements, including ones with semantic errors" {
     try expectVerdict("SELECT * FROM t5 JOIN ((t4 JOIN (t5 JOIN t6)) t7)", .accept);
     try expectVerdict("ALTER TABLE t ADD", .reject);
     try expectVerdict("CREATE TRIGGER tr AFTER INSERT ON t BEGIN", .reject);
+    try expectVerdict("CREATE TABLE t(a COLLATE c", .reject);
+    try expectVerdict("CREATE TABLE t(a COLLATE c)", .accept);
 }
 
 test "creates stand-ins for missing schema objects" {

@@ -124,15 +124,19 @@ static int next_word_is(const char **p, const char *end, const char *word) {
 
 /* Whether msg can come from a grammar action, which runs while the parser is
  * still reading the statement: CREATE x.t and CREATE TRIGGER x.tr look up
- * database x, and ALTER TABLE and CREATE TRIGGER look up their table. Errors
- * like "no such table" in a SELECT come from name resolution after the parse,
- * so the parser saw every token. */
+ * database x, ALTER TABLE and CREATE TRIGGER look up their table, and a COLLATE
+ * in a column definition looks up its collation. Errors like "no such table" in
+ * a SELECT come from name resolution after the parse, so the parser saw every
+ * token. */
 static int raised_while_parsing(const char *sql, int len, const char *msg) {
     const char *rest;
     if (has_prefix(msg, "unknown database ", &rest)) return 1;
     if (has_prefix(msg, "cannot create INSTEAD OF trigger", &rest)) return 1;
-    if (!has_prefix(msg, "no such table: ", &rest)) return 0;
     const char *p = sql, *end = sql + len;
+    if (has_prefix(msg, "no such collation sequence: ", &rest)) {
+        return next_word_is(&p, end, "CREATE") || next_word_is(&p, end, "ALTER");
+    }
+    if (!has_prefix(msg, "no such table: ", &rest)) return 0;
     if (next_word_is(&p, end, "ALTER")) return 1;
     if (!next_word_is(&p, end, "CREATE")) return 0;
     if (!next_word_is(&p, end, "TEMP")) next_word_is(&p, end, "TEMPORARY");

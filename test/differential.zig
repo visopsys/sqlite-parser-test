@@ -178,10 +178,6 @@ fn compare(result: oracle.Result, ours: Outcome) ?Mismatch {
         .accept => true,
         .reject => false,
     };
-    // A collation error is raised while the parser reduces the constraint. When the
-    // statement ends at the token that triggers it, the oracle reports it as an
-    // accept although the text may be incomplete, so no verdict can be compared.
-    if (accepted and !ours.accepted and std.mem.startsWith(u8, result.messageText(), "no such collation sequence: ")) return null;
     if (accepted != ours.accepted) return .verdict;
     if (accepted) return null;
     const expected = result.messageText();

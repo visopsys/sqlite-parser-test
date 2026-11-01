@@ -43,7 +43,7 @@ fn isImplemented(family: Family) bool {
 }
 
 /// Classifies one statement by its first token after an optional `EXPLAIN [QUERY PLAN]`.
-fn familyOf(statement: [:0]const u8) Family {
+pub fn familyOf(statement: [:0]const u8) Family {
     var t: Tokenizer = .init(statement);
     var first = t.next();
     if (first.tag == .keyword_explain) {
@@ -453,7 +453,7 @@ fn checkRoundTrip(report: *Report, scratch: std.mem.Allocator, origin: Origin, s
 }
 
 /// Our canonical rendering of `statement`; empty when it does not parse.
-fn renderStatement(arena: std.mem.Allocator, statement: []const u8) ![]const u8 {
+pub fn renderStatement(arena: std.mem.Allocator, statement: []const u8) ![]const u8 {
     const ast = try Ast.parse(arena, try arena.dupeSentinel(u8, statement, 0));
     if (ast.errors.len != 0) return "";
     var out: std.Io.Writer.Allocating = .init(arena);

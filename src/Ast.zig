@@ -370,9 +370,15 @@ fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
             else => try writer.writeAll(self.tokenText(n.main_token)),
         },
         .variable => try writer.writeAll(self.tokenText(n.main_token)),
-        .name => for (0..n.data.lhs) |i| {
-            if (i > 0) try writer.writeByte('.');
-            try self.renderName(main_token + 2 * @as(u32, @intCast(i)), writer);
+        .name => {
+            const text = self.tokenText(n.main_token);
+            // A lone "x" falls back to the string 'x' when no column has that name,
+            // which a bare x does not.
+            if (n.data.lhs == 1 and text[0] == '"') return renderQuoted(text, '"', writer);
+            for (0..n.data.lhs) |i| {
+                if (i > 0) try writer.writeByte('.');
+                try self.renderName(main_token + 2 * @as(u32, @intCast(i)), writer);
+            }
         },
         .paren => try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer),
         .row_value => {
@@ -588,6 +594,11 @@ fn renderName(self: Ast, token: u32, writer: *std.Io.Writer) std.Io.Writer.Error
     };
     const inner = if (quote == 0) text else text[1 .. text.len - 1];
     if (isPlainIdentifier(inner)) return writer.writeAll(inner);
+    try renderQuoted(text, quote, writer);
+}
+
+fn renderQuoted(text: []const u8, quote: u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const inner = if (quote == 0) text else text[1 .. text.len - 1];
     try writer.writeByte('"');
     var i: usize = 0;
     while (i < inner.len) : (i += 1) {

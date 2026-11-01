@@ -108,6 +108,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) error{OutOfMemory}!Ast {
         try tokens.append(gpa, token);
         if (token.tag == .eof) break;
     }
+    Parse.resolveContextKeywords(tokens.items(.tag));
 
     var p: Parse = .{
         .gpa = gpa,
@@ -318,6 +319,12 @@ test "EXPLAIN followed by a token that starts nothing is a syntax error" {
     try expectError("EXPLAIN QUERY FOO", "near \"FOO\": syntax error", .{ .byte_offset = 14, .line = 1, .column = 15 });
 }
 
+test "CREATE followed by a token that starts nothing blames that token" {
+    try expectError("create bogus", "near \"bogus\": syntax error", .{ .byte_offset = 7, .line = 1, .column = 8 });
+    try expectError("CREATE TEMP FOO", "near \"FOO\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("CREATE UNIQUE", "incomplete input", .{ .byte_offset = 13, .line = 1, .column = 14 });
+}
+
 test "invalid tokens are unrecognized" {
     try expectError("\x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 0, .line = 1, .column = 1 });
     try expectError(";\x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 1, .line = 1, .column = 2 });
@@ -435,6 +442,12 @@ test "quoted names are unquoted and re-quoted only when needed" {
     try expectRender("savepoint ''", "SAVEPOINT \"\";\n");
     try expectRender("savepoint \"select\"", "SAVEPOINT \"select\";\n");
     try expectRender("savepoint é_1", "SAVEPOINT é_1;\n");
+}
+
+test "WINDOW, OVER and FILTER are names outside their contexts" {
+    try expectRender("savepoint filter; release window; rollback to over", "SAVEPOINT \"filter\";\nRELEASE \"window\";\nROLLBACK TO \"over\";\n");
+    try expectError("SAVEPOINT over one", "near \"one\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
+    try expectError("ROLLBACK TO window one", "near \"one\": syntax error", .{ .byte_offset = 19, .line = 1, .column = 20 });
 }
 
 test "a name that is not a name" {

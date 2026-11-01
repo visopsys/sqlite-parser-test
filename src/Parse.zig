@@ -511,8 +511,44 @@ fn parseCreate(p: *Parse) Error!Node.Index {
     const temp = p.eat(.keyword_temp);
     const unique = !temp and p.eat(.keyword_unique);
     if (p.peek() == .keyword_index and !temp) return p.parseCreateIndex(create, unique);
+    if (p.peek() == .keyword_view and !unique) return p.parseCreateView(create, temp);
     if (unique or !p.eat(.keyword_table)) return p.failHere();
     return p.parseCreateTable(create, temp);
+}
+
+/// `VIEW ifnotexists nm dbnm eidlist_opt AS select`, after `CREATE [TEMP]`.
+fn parseCreateView(p: *Parse, create: TokenIndex, temp: bool) Error!Node.Index {
+    _ = p.nextToken();
+    var record: Node.CreateView = std.mem.zeroes(Node.CreateView);
+    record.flags.temp = temp;
+    if (p.eat(.keyword_if)) {
+        if (!p.eat(.keyword_not) or !p.eat(.keyword_exists)) return p.failHere();
+        record.flags.if_not_exists = true;
+    }
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    if (p.eat(.l_paren)) {
+        var columns: std.ArrayList(u32) = .empty;
+        defer columns.deinit(p.gpa);
+        while (true) {
+            try columns.append(p.gpa, try p.parseEidlistName());
+            if (!p.eat(.comma)) break;
+        }
+        if (!p.eat(.r_paren)) return p.failHere();
+        const range = try p.addExtraRange(columns.items);
+        record.columns_start = range.lhs;
+        record.columns_end = range.rhs;
+    }
+    if (!p.eat(.keyword_as)) return p.failHere();
+    const query = try p.parseSelectStatement();
+    return p.addNode(.{
+        .tag = .create_view,
+        .main_token = create,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = @backingInt(query) },
+    });
 }
 
 fn parseCreateTable(p: *Parse, create: TokenIndex, temp: bool) Error!Node.Index {

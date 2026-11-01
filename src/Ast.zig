@@ -210,6 +210,22 @@ pub const Node = struct {
         };
     };
 
+    /// The record `Tag.create_view` points to in `extra_data`; absent tokens are 0.
+    pub const CreateView = extern struct {
+        flags: Flags,
+        schema: u32,
+        name: u32,
+        /// The column name tokens, in `extra_data`; empty without a column list.
+        columns_start: u32,
+        columns_end: u32,
+
+        pub const Flags = packed struct(u32) {
+            temp: bool = false,
+            if_not_exists: bool = false,
+            _: u30 = 0,
+        };
+    };
+
     /// The record `Tag.drop` points to in `extra_data`; absent tokens are 0.
     pub const Drop = extern struct {
         kind: Kind,
@@ -441,6 +457,10 @@ pub const Node = struct {
         /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON table (..) [WHERE ..]`.
         /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateIndex`.
         create_index,
+        /// `CREATE [TEMP] VIEW [IF NOT EXISTS] [schema.]name [(columns)] AS rhs`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateView`.
+        /// `rhs` is the query node.
+        create_view,
         /// `DROP TABLE|VIEW|INDEX|TRIGGER [IF EXISTS] [schema.]name`. `main_token` is `DROP`.
         /// `lhs` is the `extra_data` index of a `Node.Drop`.
         drop,
@@ -710,6 +730,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .create_table => try self.renderCreateTable(n, writer),
         .alter_table => try self.renderAlterTable(n, writer),
         .create_index => try self.renderCreateIndex(n, writer),
+        .create_view => try self.renderCreateView(n, writer),
         .drop => try self.renderDrop(n, writer),
         .insert => try self.renderInsert(n, writer),
         .update => try self.renderUpdate(n, writer),
@@ -817,6 +838,24 @@ fn renderCreateIndex(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.E
         try self.renderExpr(@fromBackingInt(@intCast(t.where)), writer);
         try writer.writeByte(')');
     }
+}
+
+fn renderCreateView(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateView = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateView) / 4]);
+    try writer.writeAll(if (t.flags.temp) "CREATE TEMP VIEW " else "CREATE VIEW ");
+    if (t.flags.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    for (self.extra_data[t.columns_start..t.columns_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " (" else ", ");
+        try self.renderName(column, writer);
+    }
+    if (t.columns_end != t.columns_start) try writer.writeByte(')');
+    try writer.writeAll(" AS ");
+    try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
 }
 
 fn renderDrop(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2569,6 +2608,32 @@ test "CREATE INDEX errors" {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
     }
     try expectError("CREATE INDEX i\n  ON t(\n  a,)", "near \")\": syntax error", .{ .byte_offset = 27, .line = 3, .column = 5 });
+}
+
+test "CREATE VIEW" {
+    const cases = [_][2][:0]const u8{
+        .{ "create view v as select 1", "CREATE VIEW v AS SELECT 1;\n" },
+        .{ "create temp view if not exists m.v(a, 'b') as select x, y from t", "CREATE TEMP VIEW IF NOT EXISTS m.v (a, b) AS SELECT x, y FROM t;\n" },
+        .{ "create view v as with c(x) as (select 1) select x from c", "CREATE VIEW v AS WITH c(x) AS (SELECT 1) SELECT x FROM c;\n" },
+        .{ "create view v as select 1 union all select 2", "CREATE VIEW v AS SELECT 1 UNION ALL SELECT 2;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE VIEW errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE VIEW v", "incomplete input", 13 },
+        .{ "CREATE VIEW v AS", "incomplete input", 16 },
+        .{ "CREATE VIEW v() AS SELECT 1", "near \")\": syntax error", 14 },
+        .{ "CREATE VIEW v(a,) AS SELECT 1", "near \")\": syntax error", 16 },
+        .{ "CREATE VIEW v(a COLLATE nocase) AS SELECT 1", "syntax error after column name \"a\"", 30 },
+        .{ "CREATE VIEW v(a DESC) AS SELECT 1", "syntax error after column name \"a\"", 20 },
+        .{ "CREATE UNIQUE VIEW v AS SELECT 1", "near \"VIEW\": syntax error", 14 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
 }
 
 test "DROP" {

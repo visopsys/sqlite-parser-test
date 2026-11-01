@@ -105,6 +105,34 @@ pub const Node = struct {
     /// The `EXCLUDE` option of a window frame.
     pub const FrameExclude = enum(u32) { none, no_others, current_row, group, ties };
 
+    /// The record `Tag.insert` points to in `extra_data`. Tokens absent are 0 (no token
+    /// that follows `INSERT` or `REPLACE` has index 0); the ranges index `extra_data`.
+    pub const Insert = extern struct {
+        /// The conflict resolution keyword after `OR`.
+        conflict: u32,
+        /// The schema name when the table is written `schema.table`.
+        schema: u32,
+        table: u32,
+        alias: u32,
+        columns_start: u32,
+        columns_end: u32,
+        /// The first `upsert` node of the chain, or 0.
+        upsert: u32,
+        returning_start: u32,
+        returning_end: u32,
+    };
+
+    /// The record `Tag.upsert` points to in `extra_data`. Nodes absent are 0.
+    pub const Upsert = extern struct {
+        target_start: u32,
+        target_end: u32,
+        target_where: u32,
+        /// Empty for `DO NOTHING`.
+        set_start: u32,
+        set_end: u32,
+        set_where: u32,
+    };
+
     /// Whether a CTE says `MATERIALIZED`, `NOT MATERIALIZED` or neither.
     pub const Materialized = enum(u32) { any, yes, no };
 
@@ -273,6 +301,19 @@ pub const Node = struct {
         /// `expr [ASC | DESC] [NULLS FIRST | LAST]` in an `ORDER BY`. `lhs` is the
         /// expression. `rhs` is the `SortFlags` as an integer.
         order_item,
+        /// `INSERT [OR conflict] INTO ..` or `REPLACE INTO ..`. `main_token` is `INSERT` or
+        /// `REPLACE`. `lhs` is the `extra_data` index of a `Node.Insert`. `rhs` is the query
+        /// node (`select`, `compound`, `values` or `with_clause`), or 0 for `DEFAULT VALUES`.
+        insert,
+        /// One `ON CONFLICT [(target) [WHERE ..]] DO NOTHING | DO UPDATE SET ..` clause.
+        /// `main_token` is `ON`. `lhs` is the `extra_data` index of a `Node.Upsert`, whose
+        /// target is a range of `order_item` nodes and the settings a range of `set_item`
+        /// nodes. `rhs` is the next clause, or 0.
+        upsert,
+        /// `name = rhs` or `(names) = rhs` in a `SET` list. `main_token` is the first name,
+        /// or the left parenthesis for the second form. `lhs` is the `extra_data` index of
+        /// the name count and the name tokens.
+        set_item,
     };
 };
 
@@ -516,6 +557,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try writer.writeByte(' ');
             try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
         },
+        .insert => try self.renderInsert(n, writer),
         .compound => {
             try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(' ');
@@ -565,8 +607,78 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .window_def,
         .window_ref,
         .filter_over,
+        .upsert,
+        .set_item,
         => unreachable,
     }
+}
+
+fn renderInsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const record: *const Node.Insert = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Insert) / 4]);
+    if (self.tokens.items(.tag)[@backingInt(n.main_token)] == .keyword_replace) {
+        try writer.writeAll("REPLACE");
+    } else {
+        try writer.writeAll("INSERT");
+        if (record.conflict != 0) {
+            try writer.writeAll(" OR");
+            try self.renderKeyword(record.conflict, writer);
+        }
+    }
+    try writer.writeAll(" INTO ");
+    if (record.schema != 0) {
+        try self.renderName(record.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(record.table, writer);
+    try self.renderAlias(record.alias, writer);
+    for (self.extra_data[record.columns_start..record.columns_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " (" else ", ");
+        try self.renderName(column, writer);
+    }
+    if (record.columns_start != record.columns_end) try writer.writeByte(')');
+    if (n.data.rhs == 0) {
+        try writer.writeAll(" DEFAULT VALUES");
+    } else {
+        try writer.writeByte(' ');
+        try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+    }
+    var clause = record.upsert;
+    while (clause != 0) {
+        const upsert = self.nodes.get(clause);
+        try self.renderUpsert(upsert, writer);
+        clause = upsert.data.rhs;
+    }
+    for (self.extra_data[record.returning_start..record.returning_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " RETURNING " else ", ");
+        try self.renderResultColumn(@fromBackingInt(@intCast(column)), writer);
+    }
+}
+
+fn renderUpsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const u: *const Node.Upsert = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Upsert) / 4]);
+    try writer.writeAll(" ON CONFLICT");
+    if (u.target_start != u.target_end) {
+        try writer.writeAll(" (");
+        try self.renderExprRange(u.target_start, u.target_end, writer);
+        try writer.writeByte(')');
+        try self.renderClause(" WHERE ", u.target_where, writer);
+    }
+    if (u.set_start == u.set_end) return writer.writeAll(" DO NOTHING");
+    for (self.extra_data[u.set_start..u.set_end], 0..) |item, i| {
+        try writer.writeAll(if (i == 0) " DO UPDATE SET " else ", ");
+        const set = self.nodes.get(item);
+        const names = self.extra_data[set.data.lhs + 1 ..][0..self.extra_data[set.data.lhs]];
+        const parenthesized = self.tokens.items(.tag)[@backingInt(set.main_token)] == .l_paren;
+        if (parenthesized) try writer.writeByte('(');
+        for (names, 0..) |name, j| {
+            if (j > 0) try writer.writeAll(", ");
+            try self.renderName(name, writer);
+        }
+        if (parenthesized) try writer.writeByte(')');
+        try writer.writeAll(" = ");
+        try self.renderExpr(@fromBackingInt(@intCast(set.data.rhs)), writer);
+    }
+    try self.renderClause(" WHERE ", u.set_where, writer);
 }
 
 fn renderCte(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {

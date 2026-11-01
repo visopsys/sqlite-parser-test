@@ -10,10 +10,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const exe = b.addExecutable(.{ .name = "sqlcheck", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "sqlite_parser", .module = sqlite_parser }},
+    }) });
+    b.installArtifact(exe);
+
     const test_step = b.step("test", "Run unit, oracle and differential tests");
 
     const lib_tests = b.addTest(.{ .root_module = sqlite_parser });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
 
     // Tests that compare against the real SQLite. They link the system SQLite
     // 3.45.1 library through the C oracle in test/oracle/; the library above

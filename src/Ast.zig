@@ -105,6 +105,34 @@ pub const Node = struct {
     /// The `EXCLUDE` option of a window frame.
     pub const FrameExclude = enum(u32) { none, no_others, current_row, group, ties };
 
+    /// The record `Tag.insert` points to in `extra_data`. Tokens absent are 0 (no token
+    /// that follows `INSERT` or `REPLACE` has index 0); the ranges index `extra_data`.
+    pub const Insert = extern struct {
+        /// The conflict resolution keyword after `OR`.
+        conflict: u32,
+        /// The schema name when the table is written `schema.table`.
+        schema: u32,
+        table: u32,
+        alias: u32,
+        columns_start: u32,
+        columns_end: u32,
+        /// The first `upsert` node of the chain, or 0.
+        upsert: u32,
+        returning_start: u32,
+        returning_end: u32,
+    };
+
+    /// The record `Tag.upsert` points to in `extra_data`. Nodes absent are 0.
+    pub const Upsert = extern struct {
+        target_start: u32,
+        target_end: u32,
+        target_where: u32,
+        /// Empty for `DO NOTHING`.
+        set_start: u32,
+        set_end: u32,
+        set_where: u32,
+    };
+
     /// Whether a CTE says `MATERIALIZED`, `NOT MATERIALIZED` or neither.
     pub const Materialized = enum(u32) { any, yes, no };
 
@@ -273,6 +301,19 @@ pub const Node = struct {
         /// `expr [ASC | DESC] [NULLS FIRST | LAST]` in an `ORDER BY`. `lhs` is the
         /// expression. `rhs` is the `SortFlags` as an integer.
         order_item,
+        /// `INSERT [OR conflict] INTO ..` or `REPLACE INTO ..`. `main_token` is `INSERT` or
+        /// `REPLACE`. `lhs` is the `extra_data` index of a `Node.Insert`. `rhs` is the query
+        /// node (`select`, `compound`, `values` or `with_clause`), or 0 for `DEFAULT VALUES`.
+        insert,
+        /// One `ON CONFLICT [(target) [WHERE ..]] DO NOTHING | DO UPDATE SET ..` clause.
+        /// `main_token` is `ON`. `lhs` is the `extra_data` index of a `Node.Upsert`, whose
+        /// target is a range of `order_item` nodes and the settings a range of `set_item`
+        /// nodes. `rhs` is the next clause, or 0.
+        upsert,
+        /// `name = rhs` or `(names) = rhs` in a `SET` list. `main_token` is the first name,
+        /// or the left parenthesis for the second form. `lhs` is the `extra_data` index of
+        /// the name count and the name tokens.
+        set_item,
     };
 };
 
@@ -516,6 +557,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try writer.writeByte(' ');
             try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
         },
+        .insert => try self.renderInsert(n, writer),
         .compound => {
             try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(' ');
@@ -565,8 +607,78 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .window_def,
         .window_ref,
         .filter_over,
+        .upsert,
+        .set_item,
         => unreachable,
     }
+}
+
+fn renderInsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const record: *const Node.Insert = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Insert) / 4]);
+    if (self.tokens.items(.tag)[@backingInt(n.main_token)] == .keyword_replace) {
+        try writer.writeAll("REPLACE");
+    } else {
+        try writer.writeAll("INSERT");
+        if (record.conflict != 0) {
+            try writer.writeAll(" OR");
+            try self.renderKeyword(record.conflict, writer);
+        }
+    }
+    try writer.writeAll(" INTO ");
+    if (record.schema != 0) {
+        try self.renderName(record.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(record.table, writer);
+    try self.renderAlias(record.alias, writer);
+    for (self.extra_data[record.columns_start..record.columns_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " (" else ", ");
+        try self.renderName(column, writer);
+    }
+    if (record.columns_start != record.columns_end) try writer.writeByte(')');
+    if (n.data.rhs == 0) {
+        try writer.writeAll(" DEFAULT VALUES");
+    } else {
+        try writer.writeByte(' ');
+        try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+    }
+    var clause = record.upsert;
+    while (clause != 0) {
+        const upsert = self.nodes.get(clause);
+        try self.renderUpsert(upsert, writer);
+        clause = upsert.data.rhs;
+    }
+    for (self.extra_data[record.returning_start..record.returning_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " RETURNING " else ", ");
+        try self.renderResultColumn(@fromBackingInt(@intCast(column)), writer);
+    }
+}
+
+fn renderUpsert(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const u: *const Node.Upsert = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Upsert) / 4]);
+    try writer.writeAll(" ON CONFLICT");
+    if (u.target_start != u.target_end) {
+        try writer.writeAll(" (");
+        try self.renderExprRange(u.target_start, u.target_end, writer);
+        try writer.writeByte(')');
+        try self.renderClause(" WHERE ", u.target_where, writer);
+    }
+    if (u.set_start == u.set_end) return writer.writeAll(" DO NOTHING");
+    for (self.extra_data[u.set_start..u.set_end], 0..) |item, i| {
+        try writer.writeAll(if (i == 0) " DO UPDATE SET " else ", ");
+        const set = self.nodes.get(item);
+        const names = self.extra_data[set.data.lhs + 1 ..][0..self.extra_data[set.data.lhs]];
+        const parenthesized = self.tokens.items(.tag)[@backingInt(set.main_token)] == .l_paren;
+        if (parenthesized) try writer.writeByte('(');
+        for (names, 0..) |name, j| {
+            if (j > 0) try writer.writeAll(", ");
+            try self.renderName(name, writer);
+        }
+        if (parenthesized) try writer.writeByte(')');
+        try writer.writeAll(" = ");
+        try self.renderExpr(@fromBackingInt(@intCast(set.data.rhs)), writer);
+    }
+    try self.renderClause(" WHERE ", u.set_where, writer);
 }
 
 fn renderCte(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1806,5 +1918,104 @@ test "WITH and window syntax errors" {
     };
     for (cases) |case| {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+}
+
+test "INSERT" {
+    const cases = [_][2][:0]const u8{
+        .{ "insert into t values (1, 2)", "INSERT INTO t VALUES (1, 2);\n" },
+        .{ "INSERT INTO t VALUES (1), (2)", "INSERT INTO t VALUES (1), (2);\n" },
+        .{ "INSERT INTO t(a, b) SELECT 1, 2", "INSERT INTO t (a, b) SELECT 1, 2;\n" },
+        .{ "replace into t(a) values(1)", "REPLACE INTO t (a) VALUES (1);\n" },
+        .{ "INSERT OR REPLACE INTO main.t AS x (a, b) SELECT 1, 2", "INSERT OR REPLACE INTO main.t AS x (a, b) SELECT 1, 2;\n" },
+        .{ "INSERT OR ROLLBACK INTO t VALUES (1)", "INSERT OR ROLLBACK INTO t VALUES (1);\n" },
+        .{ "INSERT OR ABORT INTO t VALUES (1)", "INSERT OR ABORT INTO t VALUES (1);\n" },
+        .{ "INSERT OR FAIL INTO t VALUES (1)", "INSERT OR FAIL INTO t VALUES (1);\n" },
+        .{ "INSERT OR IGNORE INTO t VALUES (1)", "INSERT OR IGNORE INTO t VALUES (1);\n" },
+        .{ "INSERT INTO t AS x VALUES (1)", "INSERT INTO t AS x VALUES (1);\n" },
+        .{ "INSERT INTO 'my t' DEFAULT VALUES", "INSERT INTO \"my t\" DEFAULT VALUES;\n" },
+        .{ "INSERT INTO t DEFAULT VALUES", "INSERT INTO t DEFAULT VALUES;\n" },
+        .{ "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x", "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x;\n" },
+        .{ "with x(a) as (select 1) replace into t(a) select a from x", "WITH x(a) AS (SELECT 1) REPLACE INTO t (a) SELECT a FROM x;\n" },
+        .{ "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT DO NOTHING", "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT DO NOTHING;\n" },
+        .{ "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT(x) DO NOTHING", "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT (x) DO NOTHING;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "INSERT upsert chains and RETURNING" {
+    const cases = [_][2][:0]const u8{
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING", "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;\n" },
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1", "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1;\n" },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a COLLATE nocase DESC, b+1) WHERE a>1 DO UPDATE SET a=1+1, (b,c)=(1,2) WHERE b<3",
+            "INSERT INTO t VALUES (1) ON CONFLICT ((a COLLATE nocase) DESC, (b + 1)) WHERE (a > 1) DO UPDATE SET a = (1 + 1), (b, c) = (1, 2) WHERE (b < 3);\n",
+        },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a) DO NOTHING ON CONFLICT(b) DO UPDATE SET x=1 ON CONFLICT DO NOTHING",
+            "INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING ON CONFLICT (b) DO UPDATE SET x = 1 ON CONFLICT DO NOTHING;\n",
+        },
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT(a) DO UPDATE SET (a) = 1", "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET (a) = 1;\n" },
+        .{ "INSERT INTO t VALUES (1) RETURNING *", "INSERT INTO t VALUES (1) RETURNING *;\n" },
+        .{ "INSERT INTO t VALUES (1) RETURNING a, b+1 AS c", "INSERT INTO t VALUES (1) RETURNING a, (b + 1) AS c;\n" },
+        .{ "INSERT INTO t DEFAULT VALUES RETURNING a", "INSERT INTO t DEFAULT VALUES RETURNING a;\n" },
+        .{ "REPLACE INTO t VALUES (1) RETURNING *", "REPLACE INTO t VALUES (1) RETURNING *;\n" },
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING RETURNING a", "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING RETURNING a;\n" },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a) DO UPDATE SET a=1 RETURNING *",
+            "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1 RETURNING *;\n",
+        },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a) DO NOTHING RETURNING a, b AS c",
+            "INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING RETURNING a, b AS c;\n",
+        },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "INSERT errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const syntax = [_]Case{
+        // A join's ON swallows ON CONFLICT, so DO is the first bad token.
+        .{ "INSERT INTO t SELECT * FROM u ON CONFLICT DO NOTHING", "near \"DO\": syntax error", 42 },
+        .{ "INSERT INTO t SELECT * FROM a JOIN b ON CONFLICT DO NOTHING", "near \"DO\": syntax error", 49 },
+        .{ "INSERT INTO t SELECT * FROM a ON CONFLICT(x) DO NOTHING", "near \"DO\": syntax error", 45 },
+        .{ "INSERT INTO t SELECT * FROM a JOIN b ON CONFLICT(x) DO NOTHING", "near \"DO\": syntax error", 52 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT DO NOTHING ON CONFLICT(b) DO NOTHING", "near \"ON\": syntax error", 47 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT DO UPDATE SET a=1 ON CONFLICT DO NOTHING", "near \"ON\": syntax error", 54 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT(a) DO NOTHING RETURNING a ON CONFLICT(b) DO NOTHING", "near \"ON\": syntax error", 62 },
+        .{ "INSERT INTO t DEFAULT VALUES ON CONFLICT DO NOTHING", "near \"ON\": syntax error", 29 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT DO FOO", "near \"FOO\": syntax error", 39 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET (a,)=1", "near \")\": syntax error", 56 },
+        .{ "INSERT OR RAISE INTO t VALUES(1)", "near \"RAISE\": syntax error", 10 },
+        .{ "INSERT OR INTO t VALUES(1)", "near \"INTO\": syntax error", 10 },
+        .{ "INSERT INTO t() VALUES(1)", "near \")\": syntax error", 14 },
+        .{ "INSERT t VALUES(1)", "near \"t\": syntax error", 7 },
+    };
+    for (syntax) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+
+    const incomplete = [_][:0]const u8{
+        "INSERT",
+        "INSERT INTO",
+        "INSERT INTO t",
+        "INSERT INTO t(",
+        "INSERT INTO t(a,",
+        "INSERT INTO t VALUES",
+        "INSERT INTO t DEFAULT",
+        "INSERT INTO t DEFAULT VALUES RETURNING",
+        "INSERT INTO t VALUES(1) RETURNING",
+        "INSERT INTO t VALUES(1) ON",
+        "INSERT INTO t VALUES(1) ON CONFLICT",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a)",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET a",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET a=",
+    };
+    for (incomplete) |source| {
+        try expectError(source, "incomplete input", .{ .byte_offset = source.len, .line = 1, .column = source.len + 1 });
     }
 }

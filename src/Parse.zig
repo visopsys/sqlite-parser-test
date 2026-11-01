@@ -87,7 +87,9 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     defer p.leave();
     const first = p.peek();
     switch (first) {
-        .keyword_select, .keyword_values, .keyword_with => return p.parseSelectStatement(),
+        .keyword_select, .keyword_values => return p.parseSelectStatement(),
+        .keyword_with => return p.parseWith(true),
+        .keyword_insert, .keyword_replace => return p.parseInsert(),
         // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
         // recognized so far; every statement CREATE can start is still rejected there.
         .keyword_create => {
@@ -128,6 +130,12 @@ fn parseStatement(p: *Parse) Error!Node.Index {
 /// `select ::= WITH [RECURSIVE] wqlist selectnowith | selectnowith`.
 fn parseSelectStatement(p: *Parse) Error!Node.Index {
     if (p.peek() != .keyword_with) return p.parseSelectNoWith();
+    return p.parseWith(false);
+}
+
+/// `with` followed by a query, or by an INSERT when `allow_insert` (only a statement
+/// can be one: `cmd ::= with insert_cmd ..`).
+fn parseWith(p: *Parse, allow_insert: bool) Error!Node.Index {
     try p.enter();
     defer p.leave();
     const with = p.nextToken();
@@ -140,8 +148,131 @@ fn parseSelectStatement(p: *Parse) Error!Node.Index {
         if (!p.eat(.comma)) break;
     }
     ctes.items[1] = @intCast(ctes.items.len - 2);
-    const query = try p.parseSelectNoWith();
+    const query = if (allow_insert and (p.peek() == .keyword_insert or p.peek() == .keyword_replace))
+        try p.parseInsert()
+    else
+        try p.parseSelectNoWith();
     return p.addBinary(.with_clause, with, @fromBackingInt(try p.addExtra(ctes.items)), @backingInt(query));
+}
+
+/// `insert_cmd INTO xfullname idlist_opt select upsert` or `.. DEFAULT VALUES returning`.
+fn parseInsert(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    const first = p.nextToken();
+    var record: Node.Insert = std.mem.zeroes(Node.Insert);
+    if (p.token_tags[@backingInt(first)] == .keyword_insert and p.eat(.keyword_or)) {
+        switch (p.peek()) {
+            .keyword_rollback, .keyword_abort, .keyword_fail, .keyword_ignore, .keyword_replace => {},
+            else => return p.failHere(),
+        }
+        record.conflict = @backingInt(p.nextToken());
+    }
+    if (!p.eat(.keyword_into)) return p.failHere();
+    record.table = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.table;
+        record.table = try p.parseName(.nm);
+    }
+    if (p.eat(.keyword_as)) record.alias = try p.parseName(.nm);
+    if (p.eat(.l_paren)) {
+        var columns: std.ArrayList(u32) = .empty;
+        defer columns.deinit(p.gpa);
+        while (true) {
+            try columns.append(p.gpa, try p.parseName(.nm));
+            if (!p.eat(.comma)) break;
+        }
+        if (!p.eat(.r_paren)) return p.failHere();
+        const range = try p.addExtraRange(columns.items);
+        record.columns_start = range.lhs;
+        record.columns_end = range.rhs;
+    }
+    var source: u32 = 0;
+    if (p.eat(.keyword_default)) {
+        if (!p.eat(.keyword_values)) return p.failHere();
+    } else {
+        source = @backingInt(try p.parseSelectStatement());
+        record.upsert = try p.parseUpsert(&record);
+        return p.addInsert(first, record, source);
+    }
+    try p.parseReturning(&record);
+    return p.addInsert(first, record, source);
+}
+
+fn addInsert(p: *Parse, first: TokenIndex, record: Node.Insert, source: u32) Error!Node.Index {
+    return p.addNode(.{
+        .tag = .insert,
+        .main_token = first,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = source },
+    });
+}
+
+/// `returning ::= RETURNING selcollist | `.
+fn parseReturning(p: *Parse, record: *Node.Insert) Error!void {
+    if (!p.eat(.keyword_returning)) return;
+    const columns = try p.parseCommaList(parseResultColumn);
+    record.returning_start = columns.lhs;
+    record.returning_end = columns.rhs;
+}
+
+/// `upsert`: the first clause's node, or 0. Only a clause with a conflict target can be
+/// followed by another one; the others end the chain, and so does RETURNING.
+fn parseUpsert(p: *Parse, record: *Node.Insert) Error!u32 {
+    var first: u32 = 0;
+    var previous: u32 = 0;
+    while (p.peek() == .keyword_on) {
+        const on = p.nextToken();
+        if (!p.eat(.keyword_conflict)) return p.failHere();
+        var u: Node.Upsert = std.mem.zeroes(Node.Upsert);
+        const targeted = p.eat(.l_paren);
+        if (targeted) {
+            const target = try p.parseCommaList(parseOrderItem);
+            u.target_start = target.lhs;
+            u.target_end = target.rhs;
+            if (!p.eat(.r_paren)) return p.failHere();
+            if (p.eat(.keyword_where)) u.target_where = @backingInt(try p.parseExpr(0));
+        }
+        if (!p.eat(.keyword_do)) return p.failHere();
+        if (p.eat(.keyword_update)) {
+            if (!p.eat(.keyword_set)) return p.failHere();
+            const settings = try p.parseCommaList(parseSetItem);
+            u.set_start = settings.lhs;
+            u.set_end = settings.rhs;
+            if (p.eat(.keyword_where)) u.set_where = @backingInt(try p.parseExpr(0));
+        } else if (!p.eat(.keyword_nothing)) return p.failHere();
+        const node = @backingInt(try p.addNode(.{
+            .tag = .upsert,
+            .main_token = on,
+            .data = .{ .lhs = try p.addExtra(@ptrCast(&u)), .rhs = 0 },
+        }));
+        if (previous == 0) first = node else p.nodes.items(.data)[previous].rhs = node;
+        previous = node;
+        if (!targeted) break;
+    }
+    try p.parseReturning(record);
+    return first;
+}
+
+/// `setlist` item: `nm EQ expr` or `LP idlist RP EQ expr`.
+fn parseSetItem(p: *Parse) Error!Node.Index {
+    const first = p.tok_i;
+    var names: std.ArrayList(u32) = .empty;
+    defer names.deinit(p.gpa);
+    try names.append(p.gpa, 0);
+    const parenthesized = p.eat(.l_paren);
+    while (true) {
+        try names.append(p.gpa, try p.parseName(.nm));
+        if (!parenthesized or !p.eat(.comma)) break;
+    }
+    if (parenthesized and !p.eat(.r_paren)) return p.failHere();
+    if (!p.eat(.equal) and !p.eat(.equal_equal)) return p.failHere();
+    names.items[0] = @intCast(names.items.len - 1);
+    const expr = try p.parseExpr(0);
+    return p.addNode(.{
+        .tag = .set_item,
+        .main_token = @fromBackingInt(first),
+        .data = .{ .lhs = try p.addExtra(names.items), .rhs = @backingInt(expr) },
+    });
 }
 
 /// `wqitem ::= nm eidlist_opt wqas LP select RP`.

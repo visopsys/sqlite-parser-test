@@ -58,6 +58,19 @@ pub const Node = struct {
         explain,
         /// `EXPLAIN QUERY PLAN lhs`. `main_token` is `EXPLAIN`.
         explain_query_plan,
+        /// `BEGIN [mode] [TRANSACTION [name]]`. `lhs` is the mode token and `rhs` the
+        /// name token, each 0 when absent (no token that follows `BEGIN` has index 0).
+        /// A bare `TRANSACTION` is not recorded; it means nothing.
+        begin,
+        /// `COMMIT` or `END`, which SQLite treats alike. `lhs` is the name token or 0.
+        commit,
+        /// `ROLLBACK [TRANSACTION [name]] [TO [SAVEPOINT] name]`. `lhs` is the
+        /// transaction name token and `rhs` the savepoint name token, each 0 when absent.
+        rollback,
+        /// `SAVEPOINT name`. `lhs` is the name token.
+        savepoint,
+        /// `RELEASE [SAVEPOINT] name`. `lhs` is the name token.
+        release,
     };
 };
 
@@ -181,7 +194,70 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try writer.writeAll(if (n.tag == .explain) "EXPLAIN " else "EXPLAIN QUERY PLAN ");
             try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
         },
+        .begin => {
+            try writer.writeAll("BEGIN");
+            if (n.data.lhs != 0) try self.renderKeyword(n.data.lhs, writer);
+            try self.renderTransactionName(n.data.rhs, writer);
+        },
+        .commit => {
+            try writer.writeAll("COMMIT");
+            try self.renderTransactionName(n.data.lhs, writer);
+        },
+        .rollback => {
+            try writer.writeAll("ROLLBACK");
+            try self.renderTransactionName(n.data.lhs, writer);
+            if (n.data.rhs != 0) {
+                try writer.writeAll(" TO ");
+                try self.renderName(n.data.rhs, writer);
+            }
+        },
+        .savepoint, .release => {
+            try writer.writeAll(if (n.tag == .savepoint) "SAVEPOINT " else "RELEASE ");
+            try self.renderName(n.data.lhs, writer);
+        },
     }
+}
+
+fn renderKeyword(self: Ast, token: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const lexeme = self.tokens.items(.tag)[token].lexeme().?;
+    try writer.writeByte(' ');
+    for (lexeme) |c| try writer.writeByte(std.ascii.toUpper(c));
+}
+
+fn renderTransactionName(self: Ast, name: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (name == 0) return;
+    try writer.writeAll(" TRANSACTION ");
+    try self.renderName(name, writer);
+}
+
+/// Writes the name at `token` without its quotes, double-quoted again only when it
+/// would not parse as a plain identifier.
+fn renderName(self: Ast, token: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const text = self.tokenText(@fromBackingInt(token));
+    const quote: u8 = switch (text[0]) {
+        '"', '`', '\'' => text[0],
+        '[' => ']',
+        else => 0,
+    };
+    const inner = if (quote == 0) text else text[1 .. text.len - 1];
+    if (isPlainIdentifier(inner)) return writer.writeAll(inner);
+    try writer.writeByte('"');
+    var i: usize = 0;
+    while (i < inner.len) : (i += 1) {
+        const c = inner[i];
+        if (text[0] != '[' and c == quote) i += 1;
+        try writer.writeByte(c);
+        if (c == '"') try writer.writeByte('"');
+    }
+    try writer.writeByte('"');
+}
+
+fn isPlainIdentifier(name: []const u8) bool {
+    if (name.len == 0 or std.ascii.isDigit(name[0]) or tokenizer.getKeyword(name) != null) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c < 0x80) return false;
+    }
+    return true;
 }
 
 fn expectError(source: [:0]const u8, message: []const u8, loc: Location) !void {
@@ -276,4 +352,115 @@ test "renderError writes every tag" {
         try ast.renderError(.{ .tag = case[0], .token = @fromBackingInt(@intCast(0)) }, &buf.writer);
         try std.testing.expectEqualStrings(case[1], buf.written());
     }
+}
+
+fn expectRender(source: [:0]const u8, expected: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var ast = try parse(gpa, source);
+    defer ast.deinit(gpa);
+    try std.testing.expectEqual(0, ast.errors.len);
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try ast.render(&buf.writer);
+    try std.testing.expectEqualStrings(expected, buf.written());
+
+    const again = try gpa.dupeSentinel(u8, buf.written(), 0);
+    defer gpa.free(again);
+    var ast2 = try parse(gpa, again);
+    defer ast2.deinit(gpa);
+    try std.testing.expectEqual(0, ast2.errors.len);
+    var buf2: std.Io.Writer.Allocating = .init(gpa);
+    defer buf2.deinit();
+    try ast2.render(&buf2.writer);
+    try std.testing.expectEqualStrings(expected, buf2.written());
+}
+
+test "BEGIN" {
+    try expectRender("begin", "BEGIN;\n");
+    try expectRender("BEGIN;", "BEGIN;\n");
+    try expectRender("begin transaction", "BEGIN;\n");
+    try expectRender("begin deferred", "BEGIN DEFERRED;\n");
+    try expectRender("begin exclusive;", "BEGIN EXCLUSIVE;\n");
+    try expectRender("begin immediate transaction t1", "BEGIN IMMEDIATE TRANSACTION t1;\n");
+    try expectRender("BEGIN TRANSACTION begin", "BEGIN TRANSACTION \"begin\";\n");
+}
+
+test "COMMIT and END" {
+    try expectRender("commit", "COMMIT;\n");
+    try expectRender("END", "COMMIT;\n");
+    try expectRender("end transaction", "COMMIT;\n");
+    try expectRender("commit transaction t", "COMMIT TRANSACTION t;\n");
+    try expectRender("end transaction left", "COMMIT TRANSACTION \"left\";\n");
+}
+
+test "ROLLBACK" {
+    try expectRender("rollback", "ROLLBACK;\n");
+    try expectRender("rollback transaction", "ROLLBACK;\n");
+    try expectRender("rollback transaction t", "ROLLBACK TRANSACTION t;\n");
+    try expectRender("rollback to s", "ROLLBACK TO s;\n");
+    try expectRender("rollback to savepoint s", "ROLLBACK TO s;\n");
+    try expectRender("rollback transaction to s", "ROLLBACK TO s;\n");
+    try expectRender("rollback transaction t to savepoint s", "ROLLBACK TRANSACTION t TO s;\n");
+    try expectRender("rollback to savepoint savepoint", "ROLLBACK TO \"savepoint\";\n");
+}
+
+test "SAVEPOINT and RELEASE" {
+    try expectRender("savepoint s;release s;release savepoint s", "SAVEPOINT s;\nRELEASE s;\nRELEASE s;\n");
+    try expectRender("release savepoint savepoint", "RELEASE \"savepoint\";\n");
+}
+
+test "statements are separated by semicolons" {
+    try expectRender("begin;;commit; rollback", "BEGIN;\nCOMMIT;\nROLLBACK;\n");
+    try expectRender("explain begin; explain query plan end", "EXPLAIN BEGIN;\nEXPLAIN QUERY PLAN COMMIT;\n");
+}
+
+test "fallback keywords and strings are names" {
+    try expectRender("savepoint begin", "SAVEPOINT \"begin\";\n");
+    try expectRender("release abort", "RELEASE \"abort\";\n");
+    try expectRender("savepoint left", "SAVEPOINT \"left\";\n");
+    try expectRender("savepoint indexed", "SAVEPOINT \"indexed\";\n");
+    try expectRender("savepoint 'x'", "SAVEPOINT x;\n");
+    try expectRender("begin transaction 'a b'", "BEGIN TRANSACTION \"a b\";\n");
+    try expectRender("savepoint 'it''s'", "SAVEPOINT \"it's\";\n");
+}
+
+test "quoted names are unquoted and re-quoted only when needed" {
+    try expectRender("savepoint \"a\"", "SAVEPOINT a;\n");
+    try expectRender("savepoint `a`", "SAVEPOINT a;\n");
+    try expectRender("savepoint [a]", "SAVEPOINT a;\n");
+    try expectRender("savepoint [a b]", "SAVEPOINT \"a b\";\n");
+    try expectRender("savepoint \"a\"\"b\"", "SAVEPOINT \"a\"\"b\";\n");
+    try expectRender("savepoint `a``b`", "SAVEPOINT \"a`b\";\n");
+    try expectRender("savepoint \"1a\"", "SAVEPOINT \"1a\";\n");
+    try expectRender("savepoint ''", "SAVEPOINT \"\";\n");
+    try expectRender("savepoint \"select\"", "SAVEPOINT \"select\";\n");
+    try expectRender("savepoint é_1", "SAVEPOINT é_1;\n");
+}
+
+test "a name that is not a name" {
+    try expectError("savepoint select", "near \"select\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("release 1", "near \"1\": syntax error", .{ .byte_offset = 8, .line = 1, .column = 9 });
+}
+
+test "transaction statement errors" {
+    try expectError("BEGIN BEGIN", "near \"BEGIN\": syntax error", .{ .byte_offset = 6, .line = 1, .column = 7 });
+    try expectError("BEGIN DEFERRED DEFERRED", "near \"DEFERRED\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
+    try expectError("COMMIT x", "near \"x\": syntax error", .{ .byte_offset = 7, .line = 1, .column = 8 });
+    try expectError("COMMIT TRANSACTION x y", "near \"y\": syntax error", .{ .byte_offset = 21, .line = 1, .column = 22 });
+    try expectError("SAVEPOINT", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SAVEPOINT;", "near \";\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("RELEASE SAVEPOINT", "incomplete input", .{ .byte_offset = 17, .line = 1, .column = 18 });
+    try expectError("RELEASE SAVEPOINT;", "near \";\": syntax error", .{ .byte_offset = 17, .line = 1, .column = 18 });
+    try expectError("ROLLBACK TO", "incomplete input", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("ROLLBACK TRANSACTION TO SAVEPOINT", "incomplete input", .{ .byte_offset = 33, .line = 1, .column = 34 });
+}
+
+test "an error on a later line" {
+    try expectError("BEGIN;\nSAVEPOINT s\n  COMMIT x;", "near \"COMMIT\": syntax error", .{ .byte_offset = 21, .line = 3, .column = 3 });
+    try expectError("BEGIN\n\n  TRANSACTION a b", "near \"b\": syntax error", .{ .byte_offset = 23, .line = 3, .column = 17 });
+}
+
+test "an invalid token inside a transaction statement" {
+    try expectError("BEGIN \x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 6, .line = 1, .column = 7 });
+    try expectError("SAVEPOINT 'abc", "unrecognized token: \"'abc\"", .{ .byte_offset = 10, .line = 1, .column = 11 });
 }

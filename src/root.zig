@@ -4,6 +4,7 @@
 
 const std = @import("std");
 
+pub const Ast = @import("Ast.zig");
 pub const tokenizer = @import("tokenizer.zig");
 
 test {

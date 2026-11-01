@@ -106,11 +106,13 @@ fn selectFamily(t: *Tokenizer, first: Tag) Family {
     return if (expressions) .select_expressions else .select;
 }
 
+/// A WITH-led statement without a top-level SELECT, VALUES or DML keyword is a broken
+/// one of the WITH families, not an `other`: SQLite's verdict depends on the CTE grammar.
 fn withFamily(t: *Tokenizer) Family {
     var depth: usize = 0;
     while (true) {
         switch (t.next().tag) {
-            .eof => return .other,
+            .eof => return .select_advanced,
             .l_paren => depth += 1,
             .r_paren => depth -|= 1,
             .keyword_select, .keyword_values => if (depth == 0) return .select_advanced,
@@ -145,7 +147,15 @@ const Outcome = struct {
     offset: ?usize,
 };
 
-const Mismatch = enum { verdict, message, offset };
+const Mismatch = enum {
+    verdict,
+    message,
+    offset,
+    /// SQLite rejects our rendering of a statement we accepted.
+    render_rejected,
+    /// Our rendering does not parse back to the same rendering.
+    render_unstable,
+};
 
 /// Whether our `ours` agrees with SQLite's `result`: the same verdict and, for a
 /// rejection, the same message and, when SQLite names one, the same offset. Null
@@ -210,6 +220,7 @@ test "familyOf classifies each family" {
     try expectFamily(.update, "UPDATE t SET a = 1");
     try expectFamily(.delete, "DELETE FROM t");
     try expectFamily(.delete, "WITH x AS (SELECT 1) DELETE FROM t");
+    try expectFamily(.select_advanced, "WITH ;");
     try expectFamily(.create_table, "CREATE TABLE t(a)");
     try expectFamily(.create_table, "CREATE TEMP TABLE t(a)");
     try expectFamily(.alter_table, "ALTER TABLE t RENAME TO u");
@@ -290,6 +301,8 @@ const Failure = struct {
     /// For a mutant: the corpus statement it came from and what was changed.
     original: ?[]const u8 = null,
     mutation: ?[]const u8 = null,
+    /// For a round-trip failure: our rendering of the statement.
+    rendering: ?[]const u8 = null,
 
     pub fn format(failure: Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{s}#{d}: {t} differs\n  statement: \"{f}\"\n", .{
@@ -300,6 +313,7 @@ const Failure = struct {
         });
         if (failure.original) |original| try w.print("  original:  \"{f}\"\n", .{std.zig.fmtString(original)});
         if (failure.mutation) |mutation| try w.print("  mutation:  {s}\n", .{mutation});
+        if (failure.rendering) |rendering| try w.print("  rendering: \"{f}\"\n", .{std.zig.fmtString(rendering)});
         try w.print("  sqlite: {t} \"{f}\" offset {?d}\n", .{
             failure.sqlite_verdict,
             std.zig.fmtString(failure.sqlite_message),
@@ -321,6 +335,8 @@ const Report = struct {
     stale: std.ArrayList([]const u8) = .empty,
     checked: std.EnumArray(Family, usize) = .initFill(0),
     skipped_unknown: std.EnumArray(Family, usize) = .initFill(0),
+    /// Mutants that SQLite reads as several statements.
+    skipped_split: usize = 0,
 
     const max_printed = 20;
 
@@ -347,6 +363,7 @@ const Report = struct {
         copy.ours.message = try arena.dupe(u8, failure.ours.message);
         if (failure.original) |s| copy.original = try arena.dupe(u8, s);
         if (failure.mutation) |s| copy.mutation = try arena.dupe(u8, s);
+        if (failure.rendering) |s| copy.rendering = try arena.dupe(u8, s);
         try report.failures.append(arena, copy);
     }
 
@@ -371,7 +388,7 @@ const Report = struct {
                 family, report.checked.get(family), report.skipped_unknown.get(family),
             });
         }
-        std.debug.print("\n", .{});
+        std.debug.print(" split mutants={d}\n", .{report.skipped_split});
         return error.TestUnexpectedResult;
     }
 };
@@ -389,6 +406,87 @@ fn loadDivergences(arena: std.mem.Allocator, text: []const u8) !std.StringHashMa
         try map.put(arena, key, .unvisited);
     }
     return map;
+}
+
+/// Where a checked statement came from, for the failure report.
+const Origin = struct {
+    case_id: []const u8,
+    index: usize,
+    original: ?[]const u8 = null,
+    mutation: ?[]const u8 = null,
+};
+
+fn failureOf(origin: Origin, statement: []const u8, mismatch: Mismatch, result: oracle.Result, ours: Outcome) Failure {
+    return .{
+        .case_id = origin.case_id,
+        .index = origin.index,
+        .statement = statement,
+        .mismatch = mismatch,
+        .sqlite_verdict = result.verdict,
+        .sqlite_message = result.messageText(),
+        .sqlite_offset = result.error_offset,
+        .ours = ours,
+        .original = origin.original,
+        .mutation = origin.mutation,
+    };
+}
+
+/// Checks that SQLite accepts our rendering of `statement`, which we accepted, and
+/// that parsing the rendering renders the same text.
+fn checkRoundTrip(report: *Report, scratch: std.mem.Allocator, origin: Origin, statement: []const u8, result: oracle.Result, ours: Outcome) !void {
+    const rendered = try renderStatement(scratch, statement);
+    const mismatch: ?Mismatch = if ((try oracle.check(rendered)).verdict == .reject)
+        .render_rejected
+    else if (!std.mem.eql(u8, rendered, try renderStatement(scratch, rendered)))
+        .render_unstable
+    else
+        null;
+    if (mismatch) |m| {
+        var failure = failureOf(origin, statement, m, result, ours);
+        failure.rendering = rendered;
+        try report.addFailure(failure);
+    }
+}
+
+/// Our canonical rendering of `statement`; empty when it does not parse.
+fn renderStatement(arena: std.mem.Allocator, statement: []const u8) ![]const u8 {
+    const ast = try Ast.parse(arena, try arena.dupeSentinel(u8, statement, 0));
+    if (ast.errors.len != 0) return "";
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try ast.render(&out.writer);
+    return out.written();
+}
+
+/// Compares one statement with SQLite's `result`, and round-trips it when we accept
+/// it. A `state` marks a statement of known_divergences.txt. Returns whether the
+/// statement was compared, rather than skipped for its family or an unknown verdict.
+fn checkStatement(
+    report: *Report,
+    scratch: std.mem.Allocator,
+    origin: Origin,
+    statement: []const u8,
+    result: oracle.Result,
+    state: ?*DivergenceState,
+) !bool {
+    const family = familyOf(try scratch.dupeSentinel(u8, statement, 0));
+    if (!isImplemented(family)) return false;
+    const ours = try judge(scratch, statement);
+    if (ours.accepted) try checkRoundTrip(report, scratch, origin, statement, result, ours);
+    if (result.verdict == .unknown) {
+        report.skipped_unknown.getPtr(family).* += 1;
+        return false;
+    }
+    report.checked.getPtr(family).* += 1;
+    if (compare(result, ours)) |mismatch| {
+        if (state) |s| {
+            s.* = .disagreed;
+        } else {
+            try report.addFailure(failureOf(origin, statement, mismatch, result, ours));
+        }
+    } else if (state) |s| {
+        s.* = .agreed;
+    }
+    return true;
 }
 
 fn checkCorpus(gpa: std.mem.Allocator, report: *Report) !void {
@@ -410,35 +508,7 @@ fn checkCorpus(gpa: std.mem.Allocator, report: *Report) !void {
             const key = try std.fmt.allocPrint(scratch, "{s}#{d}", .{ case.id, index });
             const state = divergences.getPtr(key);
             if (state) |s| s.* = .skipped;
-
-            const source = try scratch.dupeSentinel(u8, statement, 0);
-            const family = familyOf(source);
-            if (!isImplemented(family)) continue;
-            if (result.verdict == .unknown) {
-                report.skipped_unknown.getPtr(family).* += 1;
-                continue;
-            }
-            report.checked.getPtr(family).* += 1;
-
-            const ours = try judge(scratch, statement);
-            if (compare(result, ours)) |mismatch| {
-                if (state) |s| {
-                    s.* = .disagreed;
-                    continue;
-                }
-                try report.addFailure(.{
-                    .case_id = case.id,
-                    .index = index,
-                    .statement = statement,
-                    .mismatch = mismatch,
-                    .sqlite_verdict = result.verdict,
-                    .sqlite_message = result.messageText(),
-                    .sqlite_offset = result.error_offset,
-                    .ours = ours,
-                });
-            } else if (state) |s| {
-                s.* = .agreed;
-            }
+            _ = try checkStatement(report, scratch, .{ .case_id = case.id, .index = index }, statement, result, state);
         }
     }
 
@@ -456,4 +526,143 @@ test "the parser agrees with SQLite on the corpus" {
     try checkCorpus(std.testing.allocator, &report);
     try report.finish();
     try std.testing.expect(report.totalChecked() > 1000);
+}
+
+const operators = [_][]const u8{
+    "+",  "-",  "*", "/", "%",  "=", "==", "!=", "<>", "<", "<=", ">", ">=",
+    "<<", ">>", "&", "|", "||", "~", ",",  ".",  "(",  ")", ";",
+};
+const literals = [_][]const u8{ "1", "1.5", "'s'", "x'00'", "?", "abc", "\"q\"" };
+
+/// A random keyword, operator or literal.
+fn vocabularyToken(random: std.Random) []const u8 {
+    const keyword_keys = sqlite_parser.tokenizer.keywords.keys();
+    var i = random.uintLessThan(usize, keyword_keys.len + operators.len + literals.len);
+    if (i < keyword_keys.len) return keyword_keys[i];
+    i -= keyword_keys.len;
+    if (i < operators.len) return operators[i];
+    return literals[i - operators.len];
+}
+
+const Mutation = enum { delete, duplicate, swap, replace, insert, truncate };
+
+/// The lexemes of `source` as slices of it, `invalid` ones included.
+fn tokenTexts(arena: std.mem.Allocator, source: [:0]const u8) ![]const []const u8 {
+    var texts: std.ArrayList([]const u8) = .empty;
+    var t: Tokenizer = .init(source);
+    while (true) {
+        const token = t.next();
+        if (token.tag == .eof) return texts.items;
+        try texts.append(arena, source[token.loc.start..token.loc.end]);
+    }
+}
+
+/// Applies one random mutation to the tokens of `original` and joins them with single
+/// spaces so that they do not fuse. `description` receives what was done.
+fn mutate(arena: std.mem.Allocator, random: std.Random, original: []const u8, description: *[]const u8) ![]const u8 {
+    const texts = try tokenTexts(arena, try arena.dupeSentinel(u8, original, 0));
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.appendSlice(arena, texts);
+    var kind = random.enumValue(Mutation);
+    if (kind == .swap and list.items.len < 2) kind = .insert;
+    const i = switch (kind) {
+        .insert => random.uintAtMost(usize, list.items.len),
+        .swap => random.uintLessThan(usize, list.items.len - 1),
+        else => random.uintLessThan(usize, list.items.len),
+    };
+    const vocabulary = vocabularyToken(random);
+    var detail: []const u8 = "";
+    switch (kind) {
+        .delete => _ = list.orderedRemove(i),
+        .duplicate => try list.insert(arena, i, list.items[i]),
+        .swap => std.mem.swap([]const u8, &list.items[i], &list.items[i + 1]),
+        .replace => {
+            detail = vocabulary;
+            list.items[i] = vocabulary;
+        },
+        .insert => {
+            detail = vocabulary;
+            try list.insert(arena, i, vocabulary);
+        },
+        .truncate => list.shrinkRetainingCapacity(i + 1),
+    }
+    description.* = try std.fmt.allocPrint(arena, "{t} at token {d} {s}", .{ kind, i, detail });
+    return std.mem.join(arena, " ", list.items);
+}
+
+/// The corpus statements of implemented families that have at least one token.
+fn implementedStatements(arena: std.mem.Allocator) ![]const []const u8 {
+    var statements: std.ArrayList([]const u8) = .empty;
+    var it: corpus.Iterator = .init(corpus.sqlite_tests);
+    while (it.next()) |case| {
+        var pos: usize = 0;
+        while (pos < case.sql.len) {
+            const length = (try oracle.check(case.sql[pos..])).length;
+            const statement = case.sql[pos..][0..length];
+            pos += length;
+            const source = try arena.dupeSentinel(u8, statement, 0);
+            if (!isImplemented(familyOf(source))) continue;
+            if ((try tokenTexts(arena, source)).len == 0) continue;
+            try statements.append(arena, statement);
+        }
+    }
+    return statements.items;
+}
+
+const mutant_seed = 0x5eed_5917;
+const min_mutants = 20_000;
+
+/// Mutates corpus statements until `min_mutants` of them were compared with SQLite.
+/// Returns the number compared.
+fn checkMutants(gpa: std.mem.Allocator, report: *Report) !usize {
+    var scratch_state: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const statements = try implementedStatements(report.arena.allocator());
+
+    var prng: std.Random.DefaultPrng = .init(mutant_seed);
+    const random = prng.random();
+    var compared: usize = 0;
+    var attempts: usize = 0;
+    while (compared < min_mutants and attempts < min_mutants * 10) : (attempts += 1) {
+        _ = scratch_state.reset(.retain_capacity);
+        const original = statements[random.uintLessThan(usize, statements.len)];
+        var description: []const u8 = undefined;
+        const mutant = try mutate(scratch, random, original, &description);
+        const result = try oracle.check(mutant);
+        if (result.length < mutant.len) {
+            report.skipped_split += 1;
+            continue;
+        }
+        const origin: Origin = .{ .case_id = "mutant", .index = attempts, .original = original, .mutation = description };
+        if (try checkStatement(report, scratch, origin, mutant, result, null)) compared += 1;
+    }
+    return compared;
+}
+
+test "the parser agrees with SQLite on mutants of the corpus" {
+    var report: Report = .init(std.testing.allocator);
+    defer report.deinit();
+    const compared = try checkMutants(std.testing.allocator, &report);
+    try report.finish();
+    try std.testing.expect(compared >= min_mutants);
+}
+
+fn fuzzStatement(_: void, smith: *std.testing.Smith) !void {
+    var raw: [256]u8 = undefined;
+    const len = smith.slice(&raw);
+    const input = raw[0 .. std.mem.indexOfScalar(u8, raw[0..len], 0) orelse len];
+    var report: Report = .init(std.testing.allocator);
+    defer report.deinit();
+    var scratch_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch_state.deinit();
+    const result = try oracle.check(input);
+    if (result.length >= input.len) {
+        _ = try checkStatement(&report, scratch_state.allocator(), .{ .case_id = "fuzz", .index = 0 }, input, result, null);
+    }
+    try report.finish();
+}
+
+test "fuzz: the parser agrees with SQLite on arbitrary input" {
+    try std.testing.fuzz({}, fuzzStatement, .{});
 }

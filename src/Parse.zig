@@ -192,6 +192,32 @@ fn acceptName(p: *Parse, class: NameClass) ?TokenIndex {
     return p.nextToken();
 }
 
+/// Whether tokenize.c's `getToken` reports the tag as `TK_ID` when it looks ahead: an
+/// identifier, a string, a join keyword, or a keyword that falls back to `ID`.
+fn isLookaheadId(tag: Token.Tag) bool {
+    return switch (tag) {
+        .keyword_join_kw, .keyword_window, .keyword_over => true,
+        else => name_tags.get(.ids).contains(tag),
+    };
+}
+
+/// Turns WINDOW, OVER and FILTER into identifiers wherever `analyzeWindowKeyword`,
+/// `analyzeOverKeyword` and `analyzeFilterKeyword` of tokenize.c do. `tags` ends with `eof`.
+pub fn resolveContextKeywords(tags: []Token.Tag) void {
+    for (tags, 0..) |*tag, i| {
+        const previous: Token.Tag = if (i > 0) tags[i - 1] else .eof;
+        const next = tags[@min(i + 1, tags.len - 1)];
+        const after_next = tags[@min(i + 2, tags.len - 1)];
+        const is_keyword = switch (tag.*) {
+            .keyword_window => isLookaheadId(next) and after_next == .keyword_as,
+            .keyword_over => previous == .r_paren and (next == .l_paren or isLookaheadId(next)),
+            .keyword_filter => previous == .r_paren and next == .l_paren,
+            else => continue,
+        };
+        if (!is_keyword) tag.* = .identifier;
+    }
+}
+
 fn peek(p: Parse) Token.Tag {
     return p.token_tags[p.tok_i];
 }

@@ -108,6 +108,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) error{OutOfMemory}!Ast {
         try tokens.append(gpa, token);
         if (token.tag == .eof) break;
     }
+    Parse.resolveContextKeywords(tokens.items(.tag));
 
     var p: Parse = .{
         .gpa = gpa,
@@ -441,6 +442,12 @@ test "quoted names are unquoted and re-quoted only when needed" {
     try expectRender("savepoint ''", "SAVEPOINT \"\";\n");
     try expectRender("savepoint \"select\"", "SAVEPOINT \"select\";\n");
     try expectRender("savepoint é_1", "SAVEPOINT é_1;\n");
+}
+
+test "WINDOW, OVER and FILTER are names outside their contexts" {
+    try expectRender("savepoint filter; release window; rollback to over", "SAVEPOINT \"filter\";\nRELEASE \"window\";\nROLLBACK TO \"over\";\n");
+    try expectError("SAVEPOINT over one", "near \"one\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
+    try expectError("ROLLBACK TO window one", "near \"one\": syntax error", .{ .byte_offset = 19, .line = 1, .column = 20 });
 }
 
 test "a name that is not a name" {

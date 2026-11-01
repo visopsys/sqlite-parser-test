@@ -15,8 +15,12 @@ tok_i: u32,
 nodes: Ast.NodeList,
 extra_data: std.ArrayList(u32),
 errors: std.ArrayList(Ast.Error),
+depth: u32 = 0,
 
 const Parse = @This();
+
+/// How deeply rules may nest; the same figure as SQLITE_MAX_EXPR_DEPTH.
+pub const max_depth = 1000;
 
 const Error = error{ OutOfMemory, ParseError };
 
@@ -68,6 +72,8 @@ fn parseExplainable(p: *Parse) Error!Node.Index {
 }
 
 fn parseStatement(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
     const first = p.peek();
     switch (first) {
         .keyword_begin, .keyword_commit, .keyword_end, .keyword_rollback, .keyword_savepoint, .keyword_release => {},
@@ -93,6 +99,16 @@ fn parseStatement(p: *Parse) Error!Node.Index {
         else => unreachable,
     };
     return p.addNode(.{ .tag = tag, .main_token = main_token, .data = data });
+}
+
+/// Called on entry to every rule that can recurse; fails once nesting passes `max_depth`.
+fn enter(p: *Parse) Error!void {
+    if (p.depth >= max_depth) return p.fail(.depth_exceeded, p.tok_i);
+    p.depth += 1;
+}
+
+fn leave(p: *Parse) void {
+    p.depth -= 1;
 }
 
 /// `transtype`: the mode token, or 0 when there is none.
@@ -250,4 +266,54 @@ test "name classes" {
             try expectNameClass(class, source, accepted);
         }
     }
+}
+
+test "nesting past max_depth is an error at the current token" {
+    const gpa = std.testing.allocator;
+    var ast = try Ast.parse(gpa, "BEGIN;\n  COMMIT");
+    defer ast.deinit(gpa);
+    var p: Parse = .{
+        .gpa = gpa,
+        .token_tags = ast.tokens.items(.tag),
+        .tok_i = 2,
+        .nodes = .empty,
+        .extra_data = .empty,
+        .errors = .empty,
+    };
+    defer p.errors.deinit(gpa);
+    for (0..max_depth) |_| try p.enter();
+    try std.testing.expectError(error.ParseError, p.enter());
+    try std.testing.expectEqual(max_depth, p.depth);
+
+    try std.testing.expectEqual(1, p.errors.items.len);
+    const err = p.errors.items[0];
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try ast.renderError(err, &buf.writer);
+    try std.testing.expectEqualStrings("Expression tree is too large (maximum depth 1000)", buf.written());
+    try std.testing.expectEqualDeep(
+        Ast.Location{ .byte_offset = 9, .line = 2, .column = 3 },
+        ast.errorLocation(err),
+    );
+
+    p.leave();
+    try p.enter();
+}
+
+test "long inputs parse without deep recursion" {
+    const gpa = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendNTimes(gpa, ';', 100_000);
+    try source.append(gpa, 0);
+    var semicolons = try Ast.parse(gpa, source.items[0 .. source.items.len - 1 :0]);
+    semicolons.deinit(gpa);
+
+    source.clearRetainingCapacity();
+    for (0..10_000) |_| try source.appendSlice(gpa, "BEGIN;");
+    try source.append(gpa, 0);
+    var begins = try Ast.parse(gpa, source.items[0 .. source.items.len - 1 :0]);
+    defer begins.deinit(gpa);
+    try std.testing.expectEqual(0, begins.errors.len);
+    try std.testing.expectEqual(10_001, begins.nodes.len);
 }

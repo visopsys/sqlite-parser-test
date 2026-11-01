@@ -191,6 +191,63 @@ pub const Node = struct {
         };
     };
 
+    /// The record `Tag.create_index` points to in `extra_data`; absent tokens and nodes are 0.
+    pub const CreateIndex = extern struct {
+        flags: Flags,
+        schema: u32,
+        name: u32,
+        table: u32,
+        /// The `order_item` nodes.
+        items_start: u32,
+        items_end: u32,
+        /// The `WHERE` expression.
+        where: u32,
+
+        pub const Flags = packed struct(u32) {
+            unique: bool = false,
+            if_not_exists: bool = false,
+            _: u30 = 0,
+        };
+    };
+
+    /// The record `Tag.create_view` points to in `extra_data`; absent tokens are 0.
+    pub const CreateView = extern struct {
+        flags: Flags,
+        schema: u32,
+        name: u32,
+        /// The column name tokens, in `extra_data`; empty without a column list.
+        columns_start: u32,
+        columns_end: u32,
+
+        pub const Flags = packed struct(u32) {
+            temp: bool = false,
+            if_not_exists: bool = false,
+            _: u30 = 0,
+        };
+    };
+
+    /// The record `Tag.create_virtual_table` points to in `extra_data`; absent tokens are 0.
+    pub const CreateVirtualTable = extern struct {
+        if_not_exists: bool,
+        schema: u32,
+        name: u32,
+        module: u32,
+        /// The first argument token and the `)` that ends the list; `args_start` is 0
+        /// without a parenthesized list, and equals `args_end` for `m()`.
+        args_start: u32,
+        args_end: u32,
+    };
+
+    /// The record `Tag.drop` points to in `extra_data`; absent tokens are 0.
+    pub const Drop = extern struct {
+        kind: Kind,
+        if_exists: bool,
+        schema: u32,
+        name: u32,
+
+        pub const Kind = enum(u32) { table, view, index, trigger };
+    };
+
     /// The record `Tag.alter_table` points to in `extra_data`; absent tokens are 0.
     pub const AlterTable = extern struct {
         action: Action,
@@ -409,6 +466,20 @@ pub const Node = struct {
         /// `ALTER TABLE [schema.]name action`. `main_token` is `ALTER`. `lhs` is the
         /// `extra_data` index of a `Node.AlterTable`.
         alter_table,
+        /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON table (..) [WHERE ..]`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateIndex`.
+        create_index,
+        /// `CREATE [TEMP] VIEW [IF NOT EXISTS] [schema.]name [(columns)] AS rhs`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateView`.
+        /// `rhs` is the query node.
+        create_view,
+        /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] [schema.]name USING module [(args)]`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a
+        /// `Node.CreateVirtualTable`.
+        create_virtual_table,
+        /// `DROP TABLE|VIEW|INDEX|TRIGGER [IF EXISTS] [schema.]name`. `main_token` is `DROP`.
+        /// `lhs` is the `extra_data` index of a `Node.Drop`.
+        drop,
         /// `name [type] constraints..`. `main_token` is the name. `lhs` is the `extra_data`
         /// index of the first and the end token of the type (equal when there is none), the
         /// constraint count and the constraint nodes.
@@ -674,6 +745,10 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         },
         .create_table => try self.renderCreateTable(n, writer),
         .alter_table => try self.renderAlterTable(n, writer),
+        .create_index => try self.renderCreateIndex(n, writer),
+        .create_view => try self.renderCreateView(n, writer),
+        .create_virtual_table => try self.renderCreateVirtualTable(n, writer),
+        .drop => try self.renderDrop(n, writer),
         .insert => try self.renderInsert(n, writer),
         .update => try self.renderUpdate(n, writer),
         .delete => try self.renderDelete(n, writer),
@@ -759,6 +834,87 @@ fn renderCreateTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.E
     try writer.writeByte(')');
     if (t.flags.without_rowid) try writer.writeAll(" WITHOUT ROWID");
     if (t.flags.strict) try writer.writeAll(if (t.flags.without_rowid) ", STRICT" else " STRICT");
+}
+
+fn renderCreateIndex(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateIndex = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateIndex) / 4]);
+    try writer.writeAll(if (t.flags.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+    if (t.flags.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    try writer.writeAll(" ON ");
+    try self.renderName(t.table, writer);
+    try writer.writeAll(" (");
+    try self.renderExprRange(t.items_start, t.items_end, writer);
+    try writer.writeByte(')');
+    if (t.where != 0) {
+        try writer.writeAll(" WHERE (");
+        try self.renderExpr(@fromBackingInt(@intCast(t.where)), writer);
+        try writer.writeByte(')');
+    }
+}
+
+fn renderCreateView(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateView = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateView) / 4]);
+    try writer.writeAll(if (t.flags.temp) "CREATE TEMP VIEW " else "CREATE VIEW ");
+    if (t.flags.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    for (self.extra_data[t.columns_start..t.columns_end], 0..) |column, i| {
+        try writer.writeAll(if (i == 0) " (" else ", ");
+        try self.renderName(column, writer);
+    }
+    if (t.columns_end != t.columns_start) try writer.writeByte(')');
+    try writer.writeAll(" AS ");
+    try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+}
+
+fn renderCreateVirtualTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateVirtualTable = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateVirtualTable) / 4]);
+    try writer.writeAll("CREATE VIRTUAL TABLE ");
+    if (t.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    try writer.writeAll(" USING ");
+    try self.renderName(t.module, writer);
+    if (t.args_start == 0) return;
+    const tags = self.tokens.items(.tag);
+    try writer.writeByte('(');
+    for (t.args_start..t.args_end) |i| {
+        if (tags[i] == .comma) {
+            try writer.writeAll(", ");
+            continue;
+        }
+        const glued = i == t.args_start or tags[i - 1] == .l_paren or tags[i - 1] == .comma or tags[i] == .r_paren;
+        if (!glued) try writer.writeByte(' ');
+        try writer.writeAll(self.tokenText(@fromBackingInt(@intCast(i))));
+    }
+    try writer.writeByte(')');
+}
+
+fn renderDrop(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.Drop = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Drop) / 4]);
+    try writer.writeAll(switch (t.kind) {
+        .table => "DROP TABLE ",
+        .view => "DROP VIEW ",
+        .index => "DROP INDEX ",
+        .trigger => "DROP TRIGGER ",
+    });
+    if (t.if_exists) try writer.writeAll("IF EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
 }
 
 fn renderAlterTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2464,6 +2620,93 @@ test "ALTER TABLE" {
     for (cases) |case| try expectRender(case[0], case[1]);
 }
 
+test "CREATE INDEX" {
+    const cases = [_][2][:0]const u8{
+        .{ "create index i on t(a)", "CREATE INDEX i ON t (a);\n" },
+        .{ "create unique index if not exists m.i on 't'(a asc, b desc nulls first, c nulls last)", "CREATE UNIQUE INDEX IF NOT EXISTS m.i ON t (a ASC, b DESC NULLS FIRST, c NULLS LAST);\n" },
+        .{ "create index i on t(a+1, abs(b) collate nocase) where a > 1 and b", "CREATE INDEX i ON t ((a + 1), (abs(b) COLLATE nocase)) WHERE (((a > 1) AND b));\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE INDEX errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE INDEX", "incomplete input", 12 },
+        .{ "CREATE UNIQUE", "incomplete input", 13 },
+        .{ "CREATE TEMP", "incomplete input", 11 },
+        .{ "CREATE INDEX i", "incomplete input", 14 },
+        .{ "CREATE INDEX i ON", "incomplete input", 17 },
+        .{ "CREATE INDEX i ON t", "incomplete input", 19 },
+        .{ "CREATE INDEX i ON t(", "incomplete input", 20 },
+        .{ "CREATE INDEX i ON t()", "near \")\": syntax error", 20 },
+        .{ "CREATE INDEX i ON t(a) WHERE", "incomplete input", 28 },
+        .{ "CREATE INDEX i ON t(a) WHERE 1 2", "near \"2\": syntax error", 31 },
+        .{ "CREATE INDEX i t(a)", "near \"t\": syntax error", 15 },
+        .{ "CREATE INDEX IF i ON t(a)", "near \"i\": syntax error", 16 },
+        .{ "CREATE TEMP INDEX i ON t(a)", "near \"INDEX\": syntax error", 12 },
+        .{ "CREATE UNIQUE TABLE t(a)", "near \"TABLE\": syntax error", 14 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+    try expectError("CREATE INDEX i\n  ON t(\n  a,)", "near \")\": syntax error", .{ .byte_offset = 27, .line = 3, .column = 5 });
+}
+
+test "CREATE VIEW" {
+    const cases = [_][2][:0]const u8{
+        .{ "create view v as select 1", "CREATE VIEW v AS SELECT 1;\n" },
+        .{ "create temp view if not exists m.v(a, 'b') as select x, y from t", "CREATE TEMP VIEW IF NOT EXISTS m.v (a, b) AS SELECT x, y FROM t;\n" },
+        .{ "create view v as with c(x) as (select 1) select x from c", "CREATE VIEW v AS WITH c(x) AS (SELECT 1) SELECT x FROM c;\n" },
+        .{ "create view v as select 1 union all select 2", "CREATE VIEW v AS SELECT 1 UNION ALL SELECT 2;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE VIEW errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE VIEW v", "incomplete input", 13 },
+        .{ "CREATE VIEW v AS", "incomplete input", 16 },
+        .{ "CREATE VIEW v() AS SELECT 1", "near \")\": syntax error", 14 },
+        .{ "CREATE VIEW v(a,) AS SELECT 1", "near \")\": syntax error", 16 },
+        .{ "CREATE VIEW v(a COLLATE nocase) AS SELECT 1", "syntax error after column name \"a\"", 30 },
+        .{ "CREATE VIEW v(a DESC) AS SELECT 1", "syntax error after column name \"a\"", 20 },
+        .{ "CREATE UNIQUE VIEW v AS SELECT 1", "near \"VIEW\": syntax error", 14 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+}
+
+test "DROP" {
+    const cases = [_][2][:0]const u8{
+        .{ "drop table t", "DROP TABLE t;\n" },
+        .{ "drop view if exists m.'v'", "DROP VIEW IF EXISTS m.v;\n" },
+        .{ "DROP INDEX main.i", "DROP INDEX main.i;\n" },
+        .{ "drop trigger if exists tr", "DROP TRIGGER IF EXISTS tr;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "DROP errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "DROP", "incomplete input", 4 },
+        .{ "DROP TABLE", "incomplete input", 10 },
+        .{ "DROP TABLE IF", "incomplete input", 13 },
+        .{ "DROP TABLE IF t", "near \"t\": syntax error", 14 },
+        .{ "DROP TABLE t.", "incomplete input", 13 },
+        .{ "DROP TABLE t.u.v", "near \".\": syntax error", 14 },
+        .{ "DROP FOO", "near \"FOO\": syntax error", 5 },
+        .{ "DROP TABLE select", "near \"select\": syntax error", 11 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+    try expectError("DROP\nTABLE\n  IF x", "near \"x\": syntax error", .{ .byte_offset = 16, .line = 3, .column = 6 });
+}
+
 test "ALTER TABLE errors" {
     const Case = struct { [:0]const u8, []const u8, usize };
     const cases = [_]Case{
@@ -2516,4 +2759,38 @@ test "CREATE TABLE errors" {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
     }
     try expectError("CREATE TABLE t(\n  a,\n  b) FOO", "unknown table option: FOO", .{ .byte_offset = 26, .line = 3, .column = 6 });
+}
+
+test "CREATE VIRTUAL TABLE" {
+    const cases = [_][2][:0]const u8{
+        .{ "create virtual table t using m", "CREATE VIRTUAL TABLE t USING m;\n" },
+        .{ "create virtual table if not exists main.'t' using 'm'", "CREATE VIRTUAL TABLE IF NOT EXISTS main.t USING m;\n" },
+        .{ "create virtual table t using m()", "CREATE VIRTUAL TABLE t USING m();\n" },
+        .{ "create virtual table t using m(a);", "CREATE VIRTUAL TABLE t USING m(a);\n" },
+        .{ "CREATE VIRTUAL TABLE t USING fts5(a,b,tokenize='porter')", "CREATE VIRTUAL TABLE t USING fts5(a, b, tokenize = 'porter');\n" },
+        .{ "create virtual table t using m(a, b(c,d), x=1)", "CREATE VIRTUAL TABLE t USING m(a, b (c, d), x = 1);\n" },
+        .{ "create virtual table t using m((a b) c, ((d)))", "CREATE VIRTUAL TABLE t USING m((a b) c, ((d)));\n" },
+        .{ "create virtual table t using m(select from, not null + 1; x)", "CREATE VIRTUAL TABLE t USING m(select from, not null + 1 ; x);\n" },
+        .{ "create virtual table t using m(a,,b)", "CREATE VIRTUAL TABLE t USING m(a, , b);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE VIRTUAL TABLE errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE VIRTUAL TABLE", "incomplete input", 20 },
+        .{ "CREATE VIRTUAL TABLE t USING", "incomplete input", 28 },
+        .{ "CREATE VIRTUAL TABLE t USING m(", "incomplete input", 31 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a", "incomplete input", 32 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a))", "near \")\": syntax error", 33 },
+        .{ "CREATE VIRTUAL TABLE t USING m(((a))", "incomplete input", 36 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a;", "incomplete input", 33 },
+        .{ "CREATE TEMP VIRTUAL TABLE t USING m", "near \"VIRTUAL\": syntax error", 12 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a) x", "near \"x\": syntax error", 34 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a $)", "unrecognized token: \"$\"", 33 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
 }

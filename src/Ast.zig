@@ -61,6 +61,23 @@ pub const Node = struct {
         _: u28 = 0,
     };
 
+    /// The record `Tag.select` points to in `extra_data`. The ranges index `extra_data`;
+    /// nodes and ranges that are absent are 0 (no expression is node 0, the root).
+    pub const Select = extern struct {
+        distinct: u32,
+        columns_start: u32,
+        columns_end: u32,
+        from: u32,
+        where: u32,
+        group_start: u32,
+        group_end: u32,
+        having: u32,
+        order_start: u32,
+        order_end: u32,
+        limit: u32,
+        offset: u32,
+    };
+
     pub const Tag = enum {
         /// The statement list. `lhs..rhs` is the range of `extra_data` holding the
         /// statement nodes. `main_token` is the first token.
@@ -99,12 +116,35 @@ pub const Node = struct {
         reindex,
         /// `ANALYZE [first [. second]]`, laid out like `reindex`.
         analyze,
-        /// `SELECT [ALL] columns`. `lhs..rhs` is the range of `extra_data` holding the
-        /// `result_star` and `result_expr` nodes. `main_token` is `SELECT`.
+        /// `SELECT [DISTINCT | ALL] columns [FROM ..] [WHERE ..] [GROUP BY ..] [HAVING ..]
+        /// [ORDER BY ..] [LIMIT ..]`. `lhs` is the `extra_data` index of a `Node.Select`.
         select,
-        /// `SELECT DISTINCT columns`, laid out like `select`.
-        select_distinct,
-        /// `*` or `name.*` as a result column. `main_token` is the star and `lhs` the
+        /// `lhs UNION [ALL] | INTERSECT | EXCEPT rhs` of `select`, `values` or `compound`
+        /// nodes. `main_token` is the operator; for `UNION ALL` the next token is `ALL`.
+        compound,
+        /// `VALUES (..), (..)`. `lhs..rhs` is the range of `extra_data` holding the
+        /// `row_value` nodes.
+        values,
+        /// `name[.name] [[AS] alias] [INDEXED BY name | NOT INDEXED]` in a `FROM` clause.
+        /// `main_token` is the first name. `lhs` is the `extra_data` index of the second
+        /// name, the alias and the `INDEXED` or `NOT` token, each 0 when absent.
+        table_ref,
+        /// `name[.name](args) [[AS] alias]` in a `FROM` clause. `main_token` is the first
+        /// name. `lhs` is the `extra_data` index of the second name, the alias (each 0 when
+        /// absent), the argument count and the argument nodes.
+        table_func,
+        /// `(select) [[AS] alias]` or `(tables) [[AS] alias]` in a `FROM` clause.
+        /// `main_token` is the left parenthesis. `lhs` is the query or `FROM` item node
+        /// inside and `rhs` the alias token or 0.
+        subquery_table,
+        /// `lhs op item [ON expr | USING (names)]` in a `FROM` clause. `main_token` is the
+        /// first token of the operator: `,`, `JOIN` or a join keyword; a keyword operator
+        /// ends at the next `JOIN`. `rhs` is the `extra_data` index of the right item node
+        /// and the `ON` or `USING` token (0 when absent), then the `ON` expression node or
+        /// the `USING` name count and tokens.
+        join,
+        /// A result column: `*` or `name.*`.
+        /// `main_token` is the star and `lhs` the
         /// table name token or 0 when there is none.
         result_star,
         /// `expr [[AS] alias]` as a result column. `lhs` is the expression and `rhs` the
@@ -174,7 +214,14 @@ pub const Node = struct {
         call,
         /// `name(*)`. `main_token` is the name.
         call_star,
-        /// `expr [ASC | DESC] [NULLS FIRST | LAST]` in a call's `ORDER BY`. `lhs` is the
+        /// `(select)` as an expression; `lhs` is the query node. `main_token` is the `(`.
+        subquery,
+        /// `EXISTS (select)`; `lhs` is the query node. `main_token` is `EXISTS`.
+        exists,
+        /// `lhs [NOT] IN (select)`. `main_token` is `IN`, negated as for `like`. `rhs` is the
+        /// query node.
+        in_select,
+        /// `expr [ASC | DESC] [NULLS FIRST | LAST]` in an `ORDER BY`. `lhs` is the
         /// expression. `rhs` is the `SortFlags` as an integer.
         order_item,
     };
@@ -185,8 +232,8 @@ pub const Error = struct {
     tag: Tag,
     token: TokenIndex,
 
-    /// One tag per message SQLite produces. The last three are raised by grammar
-    /// actions in SQLite (docs/research.md, section 3, item 8) and are not produced yet.
+    /// One tag per message SQLite produces. The ones after `depth_exceeded` are raised by
+    /// grammar actions in SQLite (docs/research.md, section 3, item 8).
     pub const Tag = enum {
         /// `near "X": syntax error`
         syntax_error,
@@ -197,8 +244,14 @@ pub const Error = struct {
         /// Nesting deeper than the parser allows.
         depth_exceeded,
         unknown_table_option,
+        /// Blamed on the first token of the join operator.
         unknown_join_type,
+        /// Blamed on the compound operator that follows the term with an `ORDER BY`.
         order_by_after_union,
+        /// Like `order_by_after_union`, for a `LIMIT`.
+        limit_after_union,
+        /// Blamed on the `ON` or `USING` of a `FROM` item that has no join before it.
+        join_clause_required,
     };
 };
 
@@ -263,11 +316,25 @@ pub fn renderError(self: Ast, err: Error, writer: *std.Io.Writer) std.Io.Writer.
         .unrecognized_token => try writer.print("unrecognized token: \"{s}\"", .{text}),
         .depth_exceeded => try writer.writeAll("Expression tree is too large (maximum depth 1000)"),
         .unknown_table_option => try writer.print("unknown table option: {s}", .{text}),
-        .unknown_join_type => try writer.print("unknown join type: {s}", .{text}),
-        .order_by_after_union => try writer.print(
-            "ORDER BY clause should come after {s} not before",
-            .{text},
-        ),
+        .unknown_join_type => {
+            const tags = self.tokens.items(.tag);
+            try writer.writeAll("unknown join type:");
+            var i: u32 = @backingInt(err.token);
+            while (tags[i] != .keyword_join) : (i += 1) {
+                try writer.print(" {s}", .{self.tokenText(@fromBackingInt(i))});
+            }
+        },
+        .order_by_after_union, .limit_after_union => {
+            try writer.writeAll(if (err.tag == .order_by_after_union) "ORDER BY" else "LIMIT");
+            try writer.writeAll(" clause should come after ");
+            try writeUpper(text, writer);
+            if (self.tokens.items(.tag)[@backingInt(err.token) + 1] == .keyword_all) try writer.writeAll(" ALL");
+            try writer.writeAll(" not before");
+        },
+        .join_clause_required => {
+            try writer.writeAll("a JOIN clause is required before ");
+            try writeUpper(text, writer);
+        },
     }
 }
 
@@ -380,12 +447,18 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
                 try self.renderName(n.data.rhs, writer);
             }
         },
-        .select, .select_distinct => {
-            try writer.writeAll(if (n.tag == .select) "SELECT " else "SELECT DISTINCT ");
-            for (self.extra_data[n.data.lhs..n.data.rhs], 0..) |column, i| {
-                if (i > 0) try writer.writeAll(", ");
-                try self.renderResultColumn(@fromBackingInt(@intCast(column)), writer);
-            }
+        .select => try self.renderSelect(n, writer),
+        .compound => {
+            try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeByte(' ');
+            try writeUpper(self.tokenText(n.main_token), writer);
+            if (self.tokens.items(.tag)[@backingInt(n.main_token) + 1] == .keyword_all) try writer.writeAll(" ALL");
+            try writer.writeByte(' ');
+            try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+        },
+        .values => {
+            try writer.writeAll("VALUES ");
+            try self.renderExprRange(n.data.lhs, n.data.rhs, writer);
         },
         .result_star,
         .result_expr,
@@ -413,8 +486,126 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .call,
         .call_star,
         .order_item,
+        .table_ref,
+        .table_func,
+        .subquery_table,
+        .join,
+        .subquery,
+        .exists,
+        .in_select,
         => unreachable,
     }
+}
+
+fn renderSelect(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const s: *const Node.Select = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Select) / 4]);
+    try writer.writeAll(if (s.distinct != 0) "SELECT DISTINCT " else "SELECT ");
+    for (self.extra_data[s.columns_start..s.columns_end], 0..) |column, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try self.renderResultColumn(@fromBackingInt(@intCast(column)), writer);
+    }
+    if (s.from != 0) {
+        try writer.writeAll(" FROM ");
+        try self.renderFrom(@fromBackingInt(@intCast(s.from)), writer);
+    }
+    try self.renderClause(" WHERE ", s.where, writer);
+    if (s.group_start != s.group_end) {
+        try writer.writeAll(" GROUP BY ");
+        try self.renderExprRange(s.group_start, s.group_end, writer);
+    }
+    try self.renderClause(" HAVING ", s.having, writer);
+    if (s.order_start != s.order_end) {
+        try writer.writeAll(" ORDER BY ");
+        try self.renderExprRange(s.order_start, s.order_end, writer);
+    }
+    try self.renderClause(" LIMIT ", s.limit, writer);
+    try self.renderClause(" OFFSET ", s.offset, writer);
+}
+
+fn renderClause(self: Ast, keyword: []const u8, expr: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (expr == 0) return;
+    try writer.writeAll(keyword);
+    try self.renderExpr(@fromBackingInt(@intCast(expr)), writer);
+}
+
+/// Writes the expression nodes in `extra_data[start..end]`, separated by commas.
+fn renderExprRange(self: Ast, start: u32, end: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (self.extra_data[start..end], 0..) |item, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try self.renderExpr(@fromBackingInt(@intCast(item)), writer);
+    }
+}
+
+/// Writes a `FROM` item or a join of them.
+fn renderFrom(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = self.nodes.get(@backingInt(node));
+    const tags = self.tokens.items(.tag);
+    switch (n.tag) {
+        .table_ref, .table_func => {
+            const second, const alias = self.extra_data[n.data.lhs..][0..2].*;
+            try self.renderName(@backingInt(n.main_token), writer);
+            if (second != 0) {
+                try writer.writeByte('.');
+                try self.renderName(second, writer);
+            }
+            if (n.tag == .table_func) {
+                try self.renderExprList(self.extra_data[n.data.lhs + 2 ..], writer);
+            }
+            try self.renderAlias(alias, writer);
+            if (n.tag == .table_ref) {
+                const indexed = self.extra_data[n.data.lhs + 2];
+                if (indexed == 0) return;
+                try writer.writeAll(if (tags[indexed] == .keyword_not) " NOT INDEXED" else " INDEXED BY ");
+                if (tags[indexed] == .keyword_indexed) try self.renderName(indexed + 2, writer);
+            }
+        },
+        .subquery_table => {
+            const inner: Node.Index = @fromBackingInt(@intCast(n.data.lhs));
+            try writer.writeByte('(');
+            switch (self.nodes.items(.tag)[@backingInt(inner)]) {
+                .select, .compound, .values => try self.renderStatement(inner, writer),
+                else => try self.renderFrom(inner, writer),
+            }
+            try writer.writeByte(')');
+            try self.renderAlias(n.data.rhs, writer);
+        },
+        .join => {
+            const item, const constraint = self.extra_data[n.data.rhs..][0..2].*;
+            try self.renderFrom(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            if (tags[@backingInt(n.main_token)] == .comma) {
+                try writer.writeAll(", ");
+            } else {
+                var i: u32 = @backingInt(n.main_token);
+                while (true) : (i += 1) {
+                    try writer.writeByte(' ');
+                    try writeUpper(self.tokenText(@fromBackingInt(i)), writer);
+                    if (tags[i] == .keyword_join) break;
+                }
+                try writer.writeByte(' ');
+            }
+            try self.renderFrom(@fromBackingInt(@intCast(item)), writer);
+            if (constraint == 0) return;
+            const payload = self.extra_data[n.data.rhs + 2 ..];
+            if (tags[constraint] == .keyword_on) {
+                try writer.writeAll(" ON ");
+                try self.renderExpr(@fromBackingInt(@intCast(payload[0])), writer);
+            } else {
+                try writer.writeAll(" USING (");
+                for (payload[1..][0..payload[0]], 0..) |name, j| {
+                    if (j > 0) try writer.writeAll(", ");
+                    try self.renderName(name, writer);
+                }
+                try writer.writeByte(')');
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn renderAlias(self: Ast, alias: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (alias == 0) return;
+    try writer.writeAll(" AS ");
+    try self.renderName(alias, writer);
 }
 
 fn renderResultColumn(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -427,9 +618,7 @@ fn renderResultColumn(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.I
         return writer.writeByte('*');
     }
     try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
-    if (n.data.rhs == 0) return;
-    try writer.writeAll(" AS ");
-    try self.renderName(n.data.rhs, writer);
+    try self.renderAlias(n.data.rhs, writer);
 }
 
 /// Writes an expression with every operator application in parentheses, so that the
@@ -496,14 +685,18 @@ fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
             try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeAll(if (n.tag == .is_null) " ISNULL)" else " NOTNULL)");
         },
-        .like, .between, .in_list, .in_table, .in_func => {
+        .subquery, .exists => {
+            if (n.tag == .exists) try writer.writeAll("EXISTS ");
+            try self.renderSubquery(n.data.lhs, writer);
+        },
+        .like, .between, .in_list, .in_table, .in_func, .in_select => {
             try writer.writeByte('(');
             try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(' ');
             if (self.tokens.items(.tag)[main_token - 1] == .keyword_not) try writer.writeAll("NOT ");
             try writeUpper(self.tokenText(n.main_token), writer);
             try writer.writeByte(' ');
-            try self.renderOperands(n, writer);
+            if (n.tag == .in_select) try self.renderSubquery(n.data.rhs, writer) else try self.renderOperands(n, writer);
             try writer.writeByte(')');
         },
         .cast => {
@@ -629,6 +822,12 @@ fn renderOperands(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Erro
         },
         else => unreachable,
     }
+}
+
+fn renderSubquery(self: Ast, query: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeByte('(');
+    try self.renderStatement(@fromBackingInt(@intCast(query)), writer);
+    try writer.writeByte(')');
 }
 
 /// Writes `(a, b, ...)` for a count followed by that many expression nodes.
@@ -771,7 +970,7 @@ test "a NUL byte ends the input" {
 
 test "renderError writes every tag" {
     const gpa = std.testing.allocator;
-    var ast = try parse(gpa, "FOO");
+    var ast = try parse(gpa, "FOO JOIN");
     defer ast.deinit(gpa);
     const cases = [_]struct { Error.Tag, []const u8 }{
         .{ .syntax_error, "near \"FOO\": syntax error" },
@@ -781,6 +980,8 @@ test "renderError writes every tag" {
         .{ .unknown_table_option, "unknown table option: FOO" },
         .{ .unknown_join_type, "unknown join type: FOO" },
         .{ .order_by_after_union, "ORDER BY clause should come after FOO not before" },
+        .{ .limit_after_union, "LIMIT clause should come after FOO not before" },
+        .{ .join_clause_required, "a JOIN clause is required before FOO" },
     };
     for (cases) |case| {
         var buf: std.Io.Writer.Allocating = .init(gpa);
@@ -1072,7 +1273,6 @@ test "special operator syntax errors" {
     try expectError("SELECT 1 IN (1,)", "near \")\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
     try expectError("SELECT 1 IN 2", "near \"2\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
     try expectError("SELECT 1 IN a.b.c", "near \".\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
-    try expectError("SELECT 1 IN (SELECT 1)", "near \"SELECT\": syntax error", .{ .byte_offset = 13, .line = 1, .column = 14 });
     try expectError("SELECT 1 IS DISTINCT 2", "near \"2\": syntax error", .{ .byte_offset = 21, .line = 1, .column = 22 });
     try expectError("SELECT 1 IS NOT DISTINCT 2", "near \"2\": syntax error", .{ .byte_offset = 25, .line = 1, .column = 26 });
     try expectError("SELECT 1 IS DISTINCT FROM", "incomplete input", .{ .byte_offset = 25, .line = 1, .column = 26 });
@@ -1119,7 +1319,6 @@ test "expression syntax errors" {
     try expectError("SELECT (1", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
     try expectError("SELECT (1 2)", "near \"2\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
     try expectError("SELECT ()", "near \")\": syntax error", .{ .byte_offset = 8, .line = 1, .column = 9 });
-    try expectError("SELECT 1 FROM", "near \"FROM\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
     try expectError("SELECT a.", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
     try expectError("SELECT a.b.c.d", "near \".\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
     try expectError("SELECT 1,", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });

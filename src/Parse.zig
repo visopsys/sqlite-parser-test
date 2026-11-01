@@ -20,6 +20,11 @@ errors: std.ArrayList(Ast.Error),
 depth: u32 = 0,
 /// The first `#N` register variable, which parse.y rejects; see `fail`.
 register_variable: ?u32 = null,
+/// A grammar-action error that SQLite raises when it reduces a rule, which takes the
+/// next token as lookahead; see `deferError`.
+deferred: ?Deferred = null,
+
+const Deferred = struct { err: Ast.Error, lookahead: u32 };
 
 const Parse = @This();
 
@@ -51,6 +56,7 @@ fn parseStatements(p: *Parse) Error!void {
         try statements.append(p.gpa, @backingInt(try p.parseExplainable()));
         // At the end of input SQLite feeds a synthetic `;`, so the last one is optional.
         if (!p.eat(.semicolon) and p.peek() != .eof) return p.failHere();
+        if (p.deferred) |d| return p.recordError(d.err.tag, @backingInt(d.err.token), d.lookahead);
     }
     if (p.register_variable) |token| return p.fail(.syntax_error, token);
 
@@ -81,7 +87,7 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     defer p.leave();
     const first = p.peek();
     switch (first) {
-        .keyword_select => return p.parseSelect(),
+        .keyword_select, .keyword_values => return p.parseSelectStatement(),
         // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
         // recognized so far; every statement CREATE can start is still rejected there.
         .keyword_create => {
@@ -119,22 +125,284 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     return p.addNode(.{ .tag = tag, .main_token = main_token, .data = data });
 }
 
-/// `select ::= SELECT distinct selcollist`; nothing may follow the result columns yet.
-fn parseSelect(p: *Parse) Error!Node.Index {
+/// `selectnowith ::= oneselect | selectnowith multiselect_op oneselect`. Terms combine
+/// from the left.
+fn parseSelectStatement(p: *Parse) Error!Node.Index {
+    var term = try p.parseOneSelect();
+    var lhs = term.node;
+    var misplaced: ?Ast.Error = null;
+    while (switch (p.peek()) {
+        .keyword_union, .keyword_except, .keyword_intersect => true,
+        else => false,
+    }) {
+        const op = p.nextToken();
+        if (p.token_tags[@backingInt(op)] == .keyword_union) _ = p.eat(.keyword_all);
+        // parserDoubleLinkSelect walks from the right, so the last such term is the one named.
+        if (term.clause) |tag| misplaced = .{ .tag = tag, .token = op };
+        term = try p.parseOneSelect();
+        lhs = try p.addBinary(.compound, op, lhs, @backingInt(term.node));
+    }
+    if (misplaced) |err| p.deferError(err);
+    return lhs;
+}
+
+/// `oneselect`, without the window clause, and the clause that a following compound
+/// operator would misplace.
+const OneSelect = struct { node: Node.Index, clause: ?Ast.Error.Tag };
+
+fn parseOneSelect(p: *Parse) Error!OneSelect {
+    if (p.peek() == .keyword_values) return .{ .node = try p.parseValues(), .clause = null };
+    if (p.peek() != .keyword_select) return p.failHere();
     const select = p.nextToken();
     const distinct = p.eat(.keyword_distinct);
     if (!distinct) _ = p.eat(.keyword_all);
-    var columns: std.ArrayList(u32) = .empty;
-    defer columns.deinit(p.gpa);
+    const columns = try p.parseCommaList(parseResultColumn);
+    const from = if (p.eat(.keyword_from)) try p.parseFrom() else null;
+    const where = if (p.eat(.keyword_where)) try p.parseExpr(0) else null;
+    const group = if (p.eat(.keyword_group)) group: {
+        if (!p.eat(.keyword_by)) return p.failHere();
+        break :group try p.parseCommaList(parseWholeExpr);
+    } else Node.Data{ .lhs = 0, .rhs = 0 };
+    const having = if (p.eat(.keyword_having)) try p.parseExpr(0) else null;
+    const order = if (p.eat(.keyword_order)) order: {
+        if (!p.eat(.keyword_by)) return p.failHere();
+        break :order try p.parseCommaList(parseOrderItem);
+    } else Node.Data{ .lhs = 0, .rhs = 0 };
+    var limit: ?Node.Index = null;
+    var offset: ?Node.Index = null;
+    if (p.eat(.keyword_limit)) {
+        limit = try p.parseExpr(0);
+        // `LIMIT a, b` takes b as the limit and a as the offset.
+        if (p.eat(.keyword_offset)) {
+            offset = try p.parseExpr(0);
+        } else if (p.eat(.comma)) {
+            offset = limit;
+            limit = try p.parseExpr(0);
+        }
+    }
+    const record: Node.Select = .{
+        .distinct = @intFromBool(distinct),
+        .columns_start = columns.lhs,
+        .columns_end = columns.rhs,
+        .from = optionalIndex(from),
+        .where = optionalIndex(where),
+        .group_start = group.lhs,
+        .group_end = group.rhs,
+        .having = optionalIndex(having),
+        .order_start = order.lhs,
+        .order_end = order.rhs,
+        .limit = optionalIndex(limit),
+        .offset = optionalIndex(offset),
+    };
+    const node = try p.addNode(.{
+        .tag = .select,
+        .main_token = select,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+    const clause: ?Ast.Error.Tag = if (order.lhs != order.rhs)
+        .order_by_after_union
+    else if (limit != null)
+        .limit_after_union
+    else
+        null;
+    return .{ .node = node, .clause = clause };
+}
+
+fn optionalIndex(node: ?Node.Index) u32 {
+    return if (node) |n| @backingInt(n) else 0;
+}
+
+fn parseWholeExpr(p: *Parse) Error!Node.Index {
+    return p.parseExpr(0);
+}
+
+/// `item (COMMA item)*`, stored as a range of `extra_data`.
+fn parseCommaList(p: *Parse, comptime parseItem: fn (*Parse) Error!Node.Index) Error!Node.Data {
+    var items: std.ArrayList(u32) = .empty;
+    defer items.deinit(p.gpa);
     while (true) {
-        try columns.append(p.gpa, @backingInt(try p.parseResultColumn()));
+        try items.append(p.gpa, @backingInt(try parseItem(p)));
         if (!p.eat(.comma)) break;
     }
+    return p.addExtraRange(items.items);
+}
+
+/// `values ::= VALUES LP nexprlist RP | values COMMA LP nexprlist RP`.
+fn parseValues(p: *Parse) Error!Node.Index {
+    const values = p.nextToken();
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(p.gpa);
+    while (true) {
+        if (p.peek() != .l_paren) return p.failHere();
+        const open = p.nextToken();
+        const items = try p.parseCommaList(parseWholeExpr);
+        if (!p.eat(.r_paren)) return p.failHere();
+        try rows.append(p.gpa, @backingInt(try p.addNode(.{ .tag = .row_value, .main_token = open, .data = items })));
+        if (!p.eat(.comma)) break;
+    }
+    return p.addNode(.{ .tag = .values, .main_token = values, .data = try p.addExtraRange(rows.items) });
+}
+
+/// `seltablist`: items joined by join operators, each optionally with `ON` or `USING`.
+fn parseFrom(p: *Parse) Error!Node.Index {
+    var parts: std.ArrayList(u32) = .empty;
+    defer parts.deinit(p.gpa);
+    var list: ?Node.Index = null;
+    var op: u32 = 0;
+    while (true) {
+        const item = try p.parseFromItem();
+        parts.clearRetainingCapacity();
+        try parts.append(p.gpa, @backingInt(item));
+        try p.parseOnUsing(&parts);
+        if (list == null and parts.items[1] != 0) {
+            p.deferError(.{ .tag = .join_clause_required, .token = @fromBackingInt(parts.items[1]) });
+        }
+        list = if (list) |left|
+            try p.addBinary(.join, @fromBackingInt(op), left, try p.addExtra(parts.items))
+        else
+            item;
+        op = try p.parseJoinOp() orelse return list.?;
+    }
+}
+
+/// A table, a table-valued function, a subquery or a parenthesized `seltablist`, with its
+/// alias and, for a table, `INDEXED BY` or `NOT INDEXED`.
+fn parseFromItem(p: *Parse) Error!Node.Index {
+    if (p.peek() == .l_paren) return p.parseParenthesizedFrom();
+    const name = p.tok_i;
+    _ = try p.parseName(.nm);
+    const second = if (p.eat(.dot)) try p.parseName(.nm) else 0;
+    if (p.eat(.l_paren)) {
+        var parts: std.ArrayList(u32) = .empty;
+        defer parts.deinit(p.gpa);
+        try parts.appendSlice(p.gpa, &.{ second, 0 });
+        try p.parseCountedExprList(&parts);
+        parts.items[1] = try p.parseAlias();
+        return p.addNode(.{
+            .tag = .table_func,
+            .main_token = @fromBackingInt(name),
+            .data = .{ .lhs = try p.addExtra(parts.items), .rhs = 0 },
+        });
+    }
+    const alias = try p.parseAlias();
+    const indexed = p.tok_i;
+    switch (p.peek()) {
+        .keyword_indexed => {
+            _ = p.nextToken();
+            if (!p.eat(.keyword_by)) return p.failHere();
+            _ = try p.parseName(.nm);
+        },
+        .keyword_not => {
+            _ = p.nextToken();
+            if (!p.eat(.keyword_indexed)) return p.failHere();
+        },
+        else => {},
+    }
     return p.addNode(.{
-        .tag = if (distinct) .select_distinct else .select,
-        .main_token = select,
-        .data = try p.addExtraRange(columns.items),
+        .tag = .table_ref,
+        .main_token = @fromBackingInt(name),
+        .data = .{
+            .lhs = try p.addExtra(&.{ second, alias, if (p.tok_i == indexed) 0 else indexed }),
+            .rhs = 0,
+        },
     });
+}
+
+/// `LP select RP as` or `LP seltablist RP as`.
+fn parseParenthesizedFrom(p: *Parse) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    const open = p.nextToken();
+    const inner = switch (p.peek()) {
+        .keyword_select, .keyword_values => try p.parseSelectStatement(),
+        else => try p.parseFrom(),
+    };
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addNode(.{
+        .tag = .subquery_table,
+        .main_token = open,
+        .data = .{ .lhs = @backingInt(inner), .rhs = try p.parseAlias() },
+    });
+}
+
+/// `as ::= AS nm | ids | `: the alias token, or 0.
+fn parseAlias(p: *Parse) Error!u32 {
+    if (p.eat(.keyword_as)) return p.parseName(.nm);
+    return if (p.acceptName(.ids)) |name| @backingInt(name) else 0;
+}
+
+/// `on_using`: appends the `ON` or `USING` token, or 0, then the expression for `ON` or the
+/// count and the names for `USING`.
+fn parseOnUsing(p: *Parse, parts: *std.ArrayList(u32)) Error!void {
+    switch (p.peek()) {
+        .keyword_on => {
+            try parts.append(p.gpa, @backingInt(p.nextToken()));
+            try parts.append(p.gpa, @backingInt(try p.parseExpr(0)));
+        },
+        .keyword_using => {
+            try parts.append(p.gpa, @backingInt(p.nextToken()));
+            if (!p.eat(.l_paren)) return p.failHere();
+            const count_at = parts.items.len;
+            try parts.append(p.gpa, 0);
+            while (true) {
+                try parts.append(p.gpa, try p.parseName(.nm));
+                if (!p.eat(.comma)) break;
+            }
+            if (!p.eat(.r_paren)) return p.failHere();
+            parts.items[count_at] = @intCast(parts.items.len - count_at - 1);
+        },
+        else => try parts.append(p.gpa, 0),
+    }
+}
+
+/// The bits of tokenize.c's join keywords, as `sqlite3JoinType` combines them.
+const JoinBits = struct {
+    const natural = 1;
+    const inner = 2;
+    const cross = 4;
+    const left = 8;
+    const right = 16;
+    const outer = 32;
+};
+
+const join_keywords = std.StaticStringMap(u8).initComptime(.{
+    .{ "natural", JoinBits.natural },
+    .{ "left", JoinBits.left | JoinBits.outer },
+    .{ "outer", JoinBits.outer },
+    .{ "right", JoinBits.right | JoinBits.outer },
+    .{ "full", JoinBits.left | JoinBits.right | JoinBits.outer },
+    .{ "inner", JoinBits.inner },
+    .{ "cross", JoinBits.inner | JoinBits.cross },
+});
+
+/// `joinop`: the first token of the operator, or null when none follows. A join keyword
+/// operator is checked as `sqlite3JoinType` does.
+fn parseJoinOp(p: *Parse) Error!?u32 {
+    const first = p.tok_i;
+    switch (p.peek()) {
+        .comma, .keyword_join => _ = p.nextToken(),
+        .keyword_join_kw => {
+            _ = p.nextToken();
+            while (p.tok_i - first < 3 and p.acceptName(.nm) != null) {}
+            if (!p.eat(.keyword_join)) return p.failHere();
+            if (!p.isValidJoinType(first, p.tok_i - 1)) p.deferError(.{ .tag = .unknown_join_type, .token = @fromBackingInt(first) });
+        },
+        else => return null,
+    }
+    return first;
+}
+
+/// Whether the tokens `first..end` are join keywords that `sqlite3JoinType` accepts.
+fn isValidJoinType(p: Parse, first: u32, end: u32) bool {
+    var bits: u8 = 0;
+    for (p.token_locs[first..end]) |loc| {
+        var buf: [8]u8 = undefined;
+        const text = p.source[loc.start..loc.end];
+        if (text.len > buf.len) return false;
+        bits |= join_keywords.get(std.ascii.lowerString(&buf, text)) orelse return false;
+    }
+    const inner_outer = JoinBits.inner | JoinBits.outer;
+    return bits & inner_outer != inner_outer and bits & (JoinBits.outer | JoinBits.left | JoinBits.right) != JoinBits.outer;
 }
 
 /// `PRAGMA nm dbnm`, optionally followed by `EQ` or `LP` and a value, then `RP`.
@@ -232,16 +500,10 @@ fn parseResultColumn(p: *Parse) Error!Node.Index {
         });
     }
     const expr = try p.parseExpr(0);
-    const alias: u32 = if (p.eat(.keyword_as))
-        try p.parseName(.nm)
-    else if (p.acceptName(.ids)) |name|
-        @backingInt(name)
-    else
-        0;
     return p.addNode(.{
         .tag = .result_expr,
         .main_token = @fromBackingInt(first),
-        .data = .{ .lhs = @backingInt(expr), .rhs = alias },
+        .data = .{ .lhs = @backingInt(expr), .rhs = try p.parseAlias() },
     });
 }
 
@@ -391,11 +653,21 @@ fn parseNegatable(p: *Parse, lhs: Node.Index) Error!Node.Index {
     }
 }
 
+fn isQueryStart(tag: Token.Tag) bool {
+    return tag == .keyword_select or tag == .keyword_values;
+}
+
 /// What follows `IN`: `(exprlist)`, `name`, `schema.name` or either name with a
 /// parenthesized argument list.
 fn parseInOperand(p: *Parse, op: TokenIndex, lhs: Node.Index) Error!Node.Index {
     var operands: std.ArrayList(u32) = .empty;
     defer operands.deinit(p.gpa);
+    if (p.peek() == .l_paren and isQueryStart(p.token_tags[p.tok_i + 1])) {
+        _ = p.nextToken();
+        const query = try p.parseSelectStatement();
+        if (!p.eat(.r_paren)) return p.failHere();
+        return p.addBinary(.in_select, op, lhs, @backingInt(query));
+    }
     if (p.eat(.l_paren)) {
         try p.parseCountedExprList(&operands);
         return p.addBinary(.in_list, op, lhs, try p.addExtra(operands.items));
@@ -475,6 +747,13 @@ fn parsePrimary(p: *Parse) Error!Node.Index {
         .keyword_cast => return p.parseCast(),
         .keyword_raise => return p.parseRaise(),
         .keyword_case => return p.parseCase(),
+        .keyword_exists => {
+            _ = p.nextToken();
+            if (!p.eat(.l_paren) or !isQueryStart(p.peek())) return p.failHere();
+            const query = try p.parseSelectStatement();
+            if (!p.eat(.r_paren)) return p.failHere();
+            return p.addNode(.{ .tag = .exists, .main_token = main_token, .data = .{ .lhs = @backingInt(query), .rhs = 0 } });
+        },
         else => {},
     }
     if (!name_tags.get(.nm).contains(first)) return p.failHere();
@@ -625,6 +904,11 @@ fn parseOrderItem(p: *Parse) Error!Node.Index {
 /// `LP expr RP` or `LP nexprlist COMMA expr RP`.
 fn parseParenthesized(p: *Parse) Error!Node.Index {
     const open = p.nextToken();
+    if (isQueryStart(p.peek())) {
+        const query = try p.parseSelectStatement();
+        if (!p.eat(.r_paren)) return p.failHere();
+        return p.addNode(.{ .tag = .subquery, .main_token = open, .data = .{ .lhs = @backingInt(query), .rhs = 0 } });
+    }
     const first = try p.parseExpr(0);
     if (p.peek() != .comma) {
         if (!p.eat(.r_paren)) return p.failHere();
@@ -789,6 +1073,13 @@ fn failHere(p: *Parse) Error {
     return p.fail(if (p.peek() == .eof) .incomplete_input else .syntax_error, p.tok_i);
 }
 
+/// A grammar action of parse.y raises its error when the rule reduces, which needs the
+/// next token as lookahead. If that token is itself a syntax error, the parser never
+/// reduces and reports the syntax error; see `fail`. Only the first such error counts.
+fn deferError(p: *Parse, err: Ast.Error) void {
+    if (p.deferred == null) p.deferred = .{ .err = err, .lookahead = p.tok_i };
+}
+
 /// Records `tag` at `token`. SQLite tokenizes as it parses, so an `invalid` token at or
 /// before the error point is reported instead.
 ///
@@ -796,15 +1087,23 @@ fn failHere(p: *Parse) Error {
 /// lookahead (`expr ::= VARIABLE`), and stops there. So a syntax error at the very next
 /// token wins; any later error never happens and the variable is blamed.
 fn fail(p: *Parse, error_tag: Ast.Error.Tag, error_token: u32) Error {
+    if (p.deferred) |d| {
+        if (error_token > d.lookahead) return p.recordError(d.err.tag, @backingInt(d.err.token), d.lookahead);
+    }
     const blamed = p.register_variable orelse error_token;
     const redirected = blamed != error_token and error_token != blamed + 1;
     const tag: Ast.Error.Tag = if (redirected) .syntax_error else error_tag;
     const token = if (redirected) blamed else error_token;
-    const first_invalid = std.mem.indexOfScalar(Token.Tag, p.token_tags[0 .. token + 1], .invalid);
+    return p.recordError(tag, token, token);
+}
+
+/// Appends the error; `seen` is the last token SQLite had tokenized when it raised it.
+fn recordError(p: *Parse, error_tag: Ast.Error.Tag, error_token: u32, seen: u32) Error {
+    const first_invalid = std.mem.indexOfScalar(Token.Tag, p.token_tags[0 .. seen + 1], .invalid);
     try p.errors.append(p.gpa, if (first_invalid) |i|
         .{ .tag = .unrecognized_token, .token = @fromBackingInt(@intCast(i)) }
     else
-        .{ .tag = tag, .token = @fromBackingInt(@intCast(token)) });
+        .{ .tag = error_tag, .token = @fromBackingInt(error_token) });
     return error.ParseError;
 }
 

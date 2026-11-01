@@ -173,6 +173,34 @@ pub const Node = struct {
         set_where: u32,
     };
 
+    /// The record `Tag.create_table` points to in `extra_data`; absent tokens are 0.
+    pub const CreateTable = extern struct {
+        flags: Flags,
+        schema: u32,
+        name: u32,
+        /// The `column_def` and constraint nodes.
+        items_start: u32,
+        items_end: u32,
+
+        pub const Flags = packed struct(u32) {
+            temp: bool = false,
+            if_not_exists: bool = false,
+            without_rowid: bool = false,
+            strict: bool = false,
+            _: u28 = 0,
+        };
+    };
+
+    /// The record of `Tag.constraint_key`: the key columns are the `order_item` nodes in
+    /// `list_start..list_end`; the other tokens are 0 when absent.
+    pub const Key = extern struct {
+        list_start: u32,
+        list_end: u32,
+        autoincrement: u32,
+        /// The token after `ON CONFLICT`.
+        conflict: u32,
+    };
+
     /// Whether a CTE says `MATERIALIZED`, `NOT MATERIALIZED` or neither.
     pub const Materialized = enum(u32) { any, yes, no };
 
@@ -360,6 +388,30 @@ pub const Node = struct {
         /// or the left parenthesis for the second form. `lhs` is the `extra_data` index of
         /// the name count and the name tokens.
         set_item,
+        /// `CREATE [TEMP] TABLE [IF NOT EXISTS] [schema.]name (..) [options]` or `.. AS rhs`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateTable`.
+        /// `rhs` is the query node of the `AS` form, else 0.
+        create_table,
+        /// `name [type] constraints..`. `main_token` is the name. `lhs` is the `extra_data`
+        /// index of the first and the end token of the type (equal when there is none), the
+        /// constraint count and the constraint nodes.
+        column_def,
+        /// `CONSTRAINT lhs` or `COLLATE lhs`. `lhs` is the name token.
+        constraint_name,
+        /// A constraint of keywords and names only: `NULL`, `NOT NULL`, `PRIMARY KEY`,
+        /// `UNIQUE`, `[NOT] DEFERRABLE` and `REFERENCES` of a column, and `FOREIGN KEY` of a
+        /// table, with their options. It is the tokens `main_token..lhs`.
+        constraint_keywords,
+        /// `PRIMARY KEY (..)` or `UNIQUE (..)` of a table. `lhs` is the `extra_data` index of a
+        /// `Node.Key`.
+        constraint_key,
+        /// `CHECK (lhs) onconf` or `[GENERATED ALWAYS] AS (lhs) [type]`; `main_token` is `CHECK`
+        /// or `AS`. `rhs` is the token after `ON CONFLICT`, or the token of `type`; 0
+        /// when absent.
+        constraint_expr,
+        /// `DEFAULT (lhs)`, `DEFAULT [+|-] lhs` for a `literal` node, or `DEFAULT name` when
+        /// `lhs` is 0, where the name is the token after `main_token`.
+        constraint_default,
     };
 };
 
@@ -603,6 +655,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try writer.writeByte(' ');
             try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
         },
+        .create_table => try self.renderCreateTable(n, writer),
         .insert => try self.renderInsert(n, writer),
         .update => try self.renderUpdate(n, writer),
         .delete => try self.renderDelete(n, writer),
@@ -657,7 +710,116 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .filter_over,
         .upsert,
         .set_item,
+        .column_def,
+        .constraint_name,
+        .constraint_keywords,
+        .constraint_key,
+        .constraint_expr,
+        .constraint_default,
         => unreachable,
+    }
+}
+
+fn renderCreateTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateTable = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateTable) / 4]);
+    try writer.writeAll(if (t.flags.temp) "CREATE TEMP TABLE " else "CREATE TABLE ");
+    if (t.flags.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    if (n.data.rhs != 0) {
+        try writer.writeAll(" AS ");
+        return self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+    }
+    for (self.extra_data[t.items_start..t.items_end], 0..) |item, i| {
+        try writer.writeAll(if (i == 0) " (" else ", ");
+        const node = self.nodes.get(item);
+        try if (node.tag == .column_def) self.renderColumnDef(node, writer) else self.renderConstraint(node, writer);
+    }
+    try writer.writeByte(')');
+    if (t.flags.without_rowid) try writer.writeAll(" WITHOUT ROWID");
+    if (t.flags.strict) try writer.writeAll(if (t.flags.without_rowid) ", STRICT" else " STRICT");
+}
+
+fn renderColumnDef(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const type_start, const type_end, const count = self.extra_data[n.data.lhs..][0..3].*;
+    try self.renderName(@backingInt(n.main_token), writer);
+    try self.renderType(type_start, type_end, writer);
+    for (self.extra_data[n.data.lhs + 3 ..][0..count]) |constraint| {
+        try writer.writeByte(' ');
+        try self.renderConstraint(self.nodes.get(constraint), writer);
+    }
+}
+
+fn renderConstraint(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const tags = self.tokens.items(.tag);
+    const main_token: u32 = @backingInt(n.main_token);
+    if (n.tag != .constraint_keywords) try writeUpper(self.tokenText(n.main_token), writer);
+    switch (n.tag) {
+        .constraint_name => {
+            try writer.writeByte(' ');
+            try self.renderName(n.data.lhs, writer);
+        },
+        .constraint_keywords => try self.renderKeywords(main_token, n.data.lhs, writer),
+        .constraint_key => {
+            const k: *const Node.Key = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Key) / 4]);
+            if (tags[main_token] == .keyword_primary) try writer.writeAll(" KEY");
+            try writer.writeAll(" (");
+            try self.renderExprRange(k.list_start, k.list_end, writer);
+            if (k.autoincrement != 0) try self.renderKeyword(k.autoincrement, writer);
+            try writer.writeByte(')');
+            try self.renderConflict(k.conflict, writer);
+        },
+        .constraint_expr => {
+            try writer.writeAll(" (");
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeByte(')');
+            if (tags[main_token] == .keyword_check) return self.renderConflict(n.data.rhs, writer);
+            if (n.data.rhs == 0) return;
+            try writer.writeByte(' ');
+            try self.renderName(n.data.rhs, writer);
+        },
+        .constraint_default => {
+            try writer.writeByte(' ');
+            if (n.data.lhs == 0) return self.renderName(main_token + 1, writer);
+            const first = tags[main_token + 1];
+            if (first == .plus or first == .minus) try writer.writeAll(self.tokenText(@fromBackingInt(main_token + 1)));
+            if (first == .l_paren) try writer.writeByte('(');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            if (first == .l_paren) try writer.writeByte(')');
+        },
+        else => unreachable,
+    }
+}
+
+/// Writes ` ON CONFLICT` and the resolution at `token`, if there is one.
+fn renderConflict(self: Ast, token: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (token == 0) return;
+    try writer.writeAll(" ON CONFLICT");
+    try self.renderKeyword(token, writer);
+}
+
+/// Writes the tokens `start..end` of a constraint: keywords in upper case, and the names
+/// in parentheses, after `REFERENCES` and after `MATCH`.
+fn renderKeywords(self: Ast, start: u32, end: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const tags = self.tokens.items(.tag);
+    var in_list = false;
+    var is_name = false;
+    for (start..end) |i| {
+        const token: u32 = @intCast(i);
+        switch (tags[i]) {
+            .l_paren => try writer.writeAll(" ("),
+            .r_paren => try writer.writeByte(')'),
+            .comma => try writer.writeAll(", "),
+            else => {
+                if (i > start and tags[i - 1] != .l_paren and tags[i - 1] != .comma) try writer.writeByte(' ');
+                if (in_list or is_name) try self.renderName(token, writer) else try writeUpper(self.tokenText(@fromBackingInt(token)), writer);
+            },
+        }
+        in_list = tags[i] == .l_paren or (in_list and tags[i] != .r_paren);
+        is_name = !is_name and (tags[i] == .keyword_match or tags[i] == .keyword_references);
     }
 }
 
@@ -2197,4 +2359,84 @@ test "UPDATE and DELETE errors" {
     }
 
     try expectError("delete from t\nlimit", "incomplete input", .{ .byte_offset = 19, .line = 2, .column = 6 });
+}
+
+test "CREATE TABLE" {
+    const cases = [_][2][:0]const u8{
+        .{ "create temp table if not exists m.t(a int primary key autoincrement, b text default (1+2) collate nocase, check(a>0)) without rowid, strict", "CREATE TEMP TABLE IF NOT EXISTS m.t (a int PRIMARY KEY AUTOINCREMENT, b text DEFAULT ((1 + 2)) COLLATE nocase, CHECK ((a > 0))) WITHOUT ROWID, STRICT;\n" },
+        .{ "create table t(a)", "CREATE TABLE t (a);\n" },
+        .{ "CREATE TABLE 'x'.\"if\"(a)", "CREATE TABLE x.\"if\" (a);\n" },
+        .{ "create table t as with c as (select 1) select * from c", "CREATE TABLE t AS WITH c AS (SELECT 1) SELECT * FROM c;\n" },
+        .{ "create table t(a, b varchar(10), c decimal(10, -2), d double precision, 'e' big int)", "CREATE TABLE t (a, b varchar(10), c decimal(10, -2), d double precision, e big int);\n" },
+        .{ "create table t(a) strict", "CREATE TABLE t (a) STRICT;\n" },
+        .{ "create table t(a) STRICT, WITHOUT ROWID; create table u(b), strict", "CREATE TABLE t (a) WITHOUT ROWID, STRICT;\nCREATE TABLE u (b) STRICT;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE TABLE column constraints" {
+    const cases = [_][2][:0]const u8{
+        .{ "create table t(a constraint c1 not null, b null, c not null on conflict fail, d null on conflict ignore)", "CREATE TABLE t (a CONSTRAINT c1 NOT NULL, b NULL, c NOT NULL ON CONFLICT FAIL, d NULL ON CONFLICT IGNORE);\n" },
+        .{ "create table t(a primary key, b primary key desc on conflict replace autoincrement, c unique on conflict rollback)", "CREATE TABLE t (a PRIMARY KEY, b PRIMARY KEY DESC ON CONFLICT REPLACE AUTOINCREMENT, c UNIQUE ON CONFLICT ROLLBACK);\n" },
+        .{ "create table t(a check (a > 1 and a < 5), b collate nocase, c collate 'rtrim')", "CREATE TABLE t (a CHECK (((a > 1) AND (a < 5))), b COLLATE nocase, c COLLATE rtrim);\n" },
+        .{ "create table t(a default 1, b default -1.5, c default +2, d default 'x', e default x'ab', f default null, g default current_timestamp, h default true, i default -'s')", "CREATE TABLE t (a DEFAULT 1, b DEFAULT -1.5, c DEFAULT +2, d DEFAULT 'x', e DEFAULT x'ab', f DEFAULT NULL, g DEFAULT CURRENT_TIMESTAMP, h DEFAULT true, i DEFAULT -'s');\n" },
+        .{ "create table t(a default (b + c * 2), b default(abs(-1)), c default replace)", "CREATE TABLE t (a DEFAULT ((b + (c * 2))), b DEFAULT (abs((-1))), c DEFAULT \"replace\");\n" },
+        .{ "create table t(a, b as (a + 1), c int as (a) virtual, d generated always as (a) stored, e int generated always as (a))", "CREATE TABLE t (a, b AS ((a + 1)), c int AS (a) \"virtual\", d \"generated\" \"always\" AS (a) stored, e int \"generated\" \"always\" AS (a));\n" },
+        .{ "create table t(a int constraint x unique constraint y check (a) collate binary default 0 not null)", "CREATE TABLE t (a int CONSTRAINT x UNIQUE CONSTRAINT y CHECK (a) COLLATE binary DEFAULT 0 NOT NULL);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE TABLE references and deferrable clauses" {
+    const cases = [_][2][:0]const u8{
+        .{ "create table t(a references p, b references p(x, y) on delete set null on update set default)", "CREATE TABLE t (a REFERENCES p, b REFERENCES p (x, y) ON DELETE SET NULL ON UPDATE SET DEFAULT);\n" },
+        .{ "create table t(a references p on delete cascade on update restrict on insert no action match full match match)", "CREATE TABLE t (a REFERENCES p ON DELETE CASCADE ON UPDATE RESTRICT ON INSERT NO ACTION MATCH \"full\" MATCH \"match\");\n" },
+        .{ "create table t(a deferrable, b not deferrable, c deferrable initially deferred, d not deferrable initially immediate)", "CREATE TABLE t (a DEFERRABLE, b NOT DEFERRABLE, c DEFERRABLE INITIALLY DEFERRED, d NOT DEFERRABLE INITIALLY IMMEDIATE);\n" },
+        .{ "create table t(a references p deferrable initially deferred not null)", "CREATE TABLE t (a REFERENCES p DEFERRABLE INITIALLY DEFERRED NOT NULL);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE TABLE table constraints" {
+    const cases = [_][2][:0]const u8{
+        .{ "create table t(a, b, primary key(a, b desc) on conflict abort, unique(a collate nocase) on conflict replace)", "CREATE TABLE t (a, b, PRIMARY KEY (a, b DESC) ON CONFLICT ABORT, UNIQUE ((a COLLATE nocase)) ON CONFLICT REPLACE);\n" },
+        .{ "create table t(a, primary key(a autoincrement), check(a > 0) on conflict ignore)", "CREATE TABLE t (a, PRIMARY KEY (a AUTOINCREMENT), CHECK ((a > 0)) ON CONFLICT IGNORE);\n" },
+        .{ "create table t(a, unique(a) unique(a) , check(a), constraint c, foreign key(a) references p(x) on delete cascade deferrable initially deferred)", "CREATE TABLE t (a, UNIQUE (a), UNIQUE (a), CHECK (a), CONSTRAINT c, FOREIGN KEY (a) REFERENCES p (x) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);\n" },
+        .{ "create table t(a, b, foreign key(a, b) references p not deferrable)", "CREATE TABLE t (a, b, FOREIGN KEY (a, b) REFERENCES p NOT DEFERRABLE);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE TABLE errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE TEMP TABLE", "incomplete input", 17 },
+        .{ "CREATE TABLE if(a)", "near \"(\": syntax error", 15 },
+        .{ "CREATE TABLE t(a,", "incomplete input", 17 },
+        .{ "CREATE TABLE t()", "near \")\": syntax error", 15 },
+        .{ "CREATE TABLE t(a,)", "near \")\": syntax error", 17 },
+        .{ "CREATE TABLE t(a, unique(b), c)", "near \"c\": syntax error", 29 },
+        .{ "CREATE TABLE t(a, primary(b))", "near \"(\": syntax error", 25 },
+        .{ "CREATE TABLE t(a, foreign key(a))", "near \")\": syntax error", 32 },
+        .{ "CREATE TABLE t(a not)", "near \")\": syntax error", 20 },
+        .{ "CREATE TABLE t(a default 1 + 2)", "near \"+\": syntax error", 27 },
+        .{ "CREATE TABLE t(a default (1,2))", "near \",\": syntax error", 27 },
+        .{ "CREATE TABLE t(a as 1)", "near \"1\": syntax error", 20 },
+        .{ "CREATE TABLE t(a not null on conflict foo)", "near \"foo\": syntax error", 38 },
+        .{ "CREATE TABLE t(a references p on conflict)", "near \"conflict\": syntax error", 33 },
+        .{ "CREATE TABLE t(a deferrable initially)", "near \")\": syntax error", 37 },
+        .{ "CREATE TABLE t(a),", "incomplete input", 18 },
+        .{ "CREATE TABLE t(a) strict strict", "near \"strict\": syntax error", 25 },
+        .{ "CREATE TABLE t AS (select 1)", "near \"(\": syntax error", 18 },
+        .{ "CREATE TABLE t(a) FOO", "unknown table option: FOO", 18 },
+        .{ "CREATE TABLE t(a) without strict", "unknown table option: strict", 26 },
+        .{ "CREATE TABLE t(a) FOO, BAR", "unknown table option: FOO", 18 },
+        .{ "CREATE TABLE t(a) \"strict\"", "unknown table option: \"strict\"", 18 },
+        .{ "CREATE TABLE t(a) FOO 1", "near \"1\": syntax error", 22 },
+        .{ "CREATE TABLE t(a, b references p(x collate nocase))", "syntax error after column name \"x\"", 49 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+    try expectError("CREATE TABLE t(\n  a,\n  b) FOO", "unknown table option: FOO", .{ .byte_offset = 26, .line = 3, .column = 6 });
 }

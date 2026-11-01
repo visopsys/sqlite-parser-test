@@ -87,7 +87,8 @@ pub const Node = struct {
         select,
         /// `SELECT DISTINCT columns`, laid out like `select`.
         select_distinct,
-        /// `*` as a result column. `main_token` is the star.
+        /// `*` or `name.*` as a result column. `main_token` is the star and `lhs` the
+        /// table name token or 0 when there is none.
         result_star,
         /// `expr [[AS] alias]` as a result column. `lhs` is the expression and `rhs` the
         /// alias token or 0 when there is none (the first token is never an alias).
@@ -200,7 +201,9 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) error{OutOfMemory}!Ast {
 
     var p: Parse = .{
         .gpa = gpa,
+        .source = source,
         .token_tags = tokens.items(.tag),
+        .token_locs = tokens.items(.loc),
         .tok_i = 0,
         .nodes = .empty,
         .extra_data = .empty,
@@ -343,7 +346,13 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
 
 fn renderResultColumn(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     const n = self.nodes.get(@backingInt(node));
-    if (n.tag == .result_star) return writer.writeByte('*');
+    if (n.tag == .result_star) {
+        if (n.data.lhs != 0) {
+            try self.renderName(n.data.lhs, writer);
+            try writer.writeByte('.');
+        }
+        return writer.writeByte('*');
+    }
     try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
     if (n.data.rhs == 0) return;
     try writer.writeAll(" AS ");
@@ -1097,4 +1106,18 @@ test "CAST, CASE, RAISE and call syntax errors" {
     try expectError("SELECT f(a ORDER BY b NULLS)", "near \")\": syntax error", .{ .byte_offset = 27, .line = 1, .column = 28 });
     try expectError("SELECT f(a) OVER (x)", "near \"OVER\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
     try expectError("SELECT 'f'(1)", "near \"(\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+}
+
+test "qualified star result columns" {
+    try expectRender("SELECT t.*", "SELECT t.*;\n");
+    try expectRender("select 'a'.*, \"b c\".*, x", "SELECT a.*, \"b c\".*, x;\n");
+    try expectError("SELECT a.b.*", "near \"*\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+}
+
+test "register variables are rejected unless the next token is the error" {
+    try expectError("SELECT 1 IS #1;", "near \"#1\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("SELECT #1 , 2 +", "near \"#1\": syntax error", .{ .byte_offset = 7, .line = 1, .column = 8 });
+    try expectError("SELECT +#1 )", "near \")\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("SELECT #1 #2", "near \"#2\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectRender("SELECT #abc, #x1", "SELECT #abc, #x1;\n");
 }

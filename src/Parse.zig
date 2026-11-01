@@ -10,12 +10,16 @@ const Token = Ast.Token;
 const tokenizer = @import("tokenizer.zig");
 
 gpa: Allocator,
+source: [:0]const u8,
 token_tags: []const Token.Tag,
+token_locs: []const Token.Loc,
 tok_i: u32,
 nodes: Ast.NodeList,
 extra_data: std.ArrayList(u32),
 errors: std.ArrayList(Ast.Error),
 depth: u32 = 0,
+/// The first `#N` register variable, which parse.y rejects; see `fail`.
+register_variable: ?u32 = null,
 
 const Parse = @This();
 
@@ -48,6 +52,7 @@ fn parseStatements(p: *Parse) Error!void {
         // At the end of input SQLite feeds a synthetic `;`, so the last one is optional.
         if (!p.eat(.semicolon) and p.peek() != .eof) return p.failHere();
     }
+    if (p.register_variable) |token| return p.fail(.syntax_error, token);
 
     const start: u32 = @intCast(p.extra_data.items.len);
     try p.extra_data.appendSlice(p.gpa, statements.items);
@@ -135,6 +140,14 @@ fn parseResultColumn(p: *Parse) Error!Node.Index {
         .main_token = @fromBackingInt(first),
         .data = .{ .lhs = 0, .rhs = 0 },
     });
+    if (name_tags.get(.nm).contains(p.peek()) and p.token_tags[first + 1] == .dot and p.token_tags[first + 2] == .star) {
+        p.tok_i += 3;
+        return p.addNode(.{
+            .tag = .result_star,
+            .main_token = @fromBackingInt(first + 2),
+            .data = .{ .lhs = first, .rhs = 0 },
+        });
+    }
     const expr = try p.parseExpr(0);
     const alias: u32 = if (p.eat(.keyword_as))
         try p.parseName(.nm)
@@ -355,6 +368,9 @@ fn parsePrimary(p: *Parse) Error!Node.Index {
             return p.addNode(.{ .tag = .literal, .main_token = main_token, .data = .{ .lhs = 0, .rhs = 0 } });
         },
         .variable => {
+            const start = p.token_locs[p.tok_i].start;
+            if (p.register_variable == null and p.source[start] == '#' and std.ascii.isDigit(p.source[start + 1]))
+                p.register_variable = p.tok_i;
             _ = p.nextToken();
             return p.addNode(.{ .tag = .variable, .main_token = main_token, .data = .{ .lhs = 0, .rhs = 0 } });
         },
@@ -692,7 +708,15 @@ fn failHere(p: *Parse) Error {
 
 /// Records `tag` at `token`. SQLite tokenizes as it parses, so an `invalid` token at or
 /// before the error point is reported instead.
-fn fail(p: *Parse, tag: Ast.Error.Tag, token: u32) Error {
+///
+/// parse.y reports `#N` only when it reduces the variable, which takes the next token as
+/// lookahead (`expr ::= VARIABLE`), and stops there. So a syntax error at the very next
+/// token wins; any later error never happens and the variable is blamed.
+fn fail(p: *Parse, error_tag: Ast.Error.Tag, error_token: u32) Error {
+    const blamed = p.register_variable orelse error_token;
+    const redirected = blamed != error_token and error_token != blamed + 1;
+    const tag: Ast.Error.Tag = if (redirected) .syntax_error else error_tag;
+    const token = if (redirected) blamed else error_token;
     const first_invalid = std.mem.indexOfScalar(Token.Tag, p.token_tags[0 .. token + 1], .invalid);
     try p.errors.append(p.gpa, if (first_invalid) |i|
         .{ .tag = .unrecognized_token, .token = @fromBackingInt(@intCast(i)) }
@@ -706,7 +730,9 @@ fn expectNameClass(class: NameClass, source: [:0]const u8, accepted: bool) !void
     const tags = [_]Token.Tag{ t.next().tag, .eof };
     var p: Parse = .{
         .gpa = std.testing.allocator,
+        .source = source,
         .token_tags = &tags,
+        .token_locs = &.{},
         .tok_i = 0,
         .nodes = .empty,
         .extra_data = .empty,
@@ -751,7 +777,9 @@ test "nesting past max_depth is an error at the current token" {
     defer ast.deinit(gpa);
     var p: Parse = .{
         .gpa = gpa,
+        .source = ast.source,
         .token_tags = ast.tokens.items(.tag),
+        .token_locs = ast.tokens.items(.loc),
         .tok_i = 2,
         .nodes = .empty,
         .extra_data = .empty,

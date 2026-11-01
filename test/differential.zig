@@ -36,7 +36,7 @@ pub const Family = enum {
 };
 
 /// The families whose statements the differential tests check.
-const implemented = [_]Family{ .empty, .transaction, .other };
+const implemented = [_]Family{ .empty, .transaction, .other, .select_expressions };
 
 fn isImplemented(family: Family) bool {
     return std.mem.indexOfScalar(Family, &implemented, family) != null;
@@ -168,7 +168,11 @@ fn compare(result: oracle.Result, ours: Outcome) ?Mismatch {
     };
     if (accepted != ours.accepted) return .verdict;
     if (accepted) return null;
-    if (!std.mem.eql(u8, result.messageText(), ours.message)) return .message;
+    const expected = result.messageText();
+    // The oracle's buffer cuts a longer message short, so only its prefix is known.
+    const truncated = expected.len == result.message_buffer.len - 1;
+    const same = if (truncated) std.mem.startsWith(u8, ours.message, expected) else std.mem.eql(u8, expected, ours.message);
+    if (!same) return .message;
     if (result.error_offset) |offset| {
         if (offset != ours.offset) return .offset;
     }

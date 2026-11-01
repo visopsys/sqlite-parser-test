@@ -314,15 +314,21 @@ fn parseInOperand(p: *Parse, op: TokenIndex, lhs: Node.Index) Error!Node.Index {
 /// `exprlist RP`, after the left parenthesis: appends the number of expressions to `list`
 /// and then the expressions.
 fn parseCountedExprList(p: *Parse, list: *std.ArrayList(u32)) Error!void {
+    try p.parseExprListBody(list);
+    if (!p.eat(.r_paren)) return p.failHere();
+}
+
+/// `exprlist`, which may be empty: appends the number of expressions to `list` and then
+/// the expressions. The list ends before `)` or `ORDER`.
+fn parseExprListBody(p: *Parse, list: *std.ArrayList(u32)) Error!void {
     const count_at = list.items.len;
     try list.append(p.gpa, 0);
-    if (p.peek() != .r_paren) {
+    if (p.peek() != .r_paren and p.peek() != .keyword_order) {
         while (true) {
             try list.append(p.gpa, @backingInt(try p.parseExpr(0)));
             if (!p.eat(.comma)) break;
         }
     }
-    if (!p.eat(.r_paren)) return p.failHere();
     list.items[count_at] = @intCast(list.items.len - count_at - 1);
 }
 
@@ -365,13 +371,156 @@ fn parsePrimary(p: *Parse) Error!Node.Index {
         .l_paren => return p.parseParenthesized(),
         else => {},
     }
-    // CAST and RAISE open expressions of their own, so they are not names here.
-    if (first == .keyword_cast or first == .keyword_raise) return p.failHere();
+    // CAST, RAISE and CASE open expressions of their own, so they are not names here.
+    switch (first) {
+        .keyword_cast => return p.parseCast(),
+        .keyword_raise => return p.parseRaise(),
+        .keyword_case => return p.parseCase(),
+        else => {},
+    }
     if (!name_tags.get(.nm).contains(first)) return p.failHere();
+    if (name_tags.get(.idj).contains(first) and p.token_tags[p.tok_i + 1] == .l_paren) return p.parseCall();
     _ = p.nextToken();
     var parts: u32 = 1;
     while (parts < 3 and p.eat(.dot)) : (parts += 1) _ = try p.parseName(.nm);
     return p.addNode(.{ .tag = .name, .main_token = main_token, .data = .{ .lhs = parts, .rhs = 0 } });
+}
+
+/// `CAST LP expr AS typetoken RP`, where `typetoken` is any number of `ids` and then
+/// `(signed)` or `(signed, signed)`, the last two only after a name.
+fn parseCast(p: *Parse) Error!Node.Index {
+    const cast = p.nextToken();
+    if (!p.eat(.l_paren)) return p.failHere();
+    const operand = try p.parseExpr(0);
+    if (!p.eat(.keyword_as)) return p.failHere();
+    const type_start = p.tok_i;
+    if (p.acceptName(.ids) != null) {
+        while (p.acceptName(.ids) != null) {}
+        if (p.eat(.l_paren)) {
+            try p.parseSigned();
+            if (p.eat(.comma)) try p.parseSigned();
+            if (!p.eat(.r_paren)) return p.failHere();
+        }
+    }
+    const type_end = p.tok_i;
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addNode(.{
+        .tag = .cast,
+        .main_token = cast,
+        .data = .{ .lhs = @backingInt(operand), .rhs = try p.addExtra(&.{ type_start, type_end }) },
+    });
+}
+
+/// `signed ::= [PLUS | MINUS] number`.
+fn parseSigned(p: *Parse) Error!void {
+    _ = p.eat(.plus) or p.eat(.minus);
+    if (!p.eat(.integer_literal) and !p.eat(.float_literal)) return p.failHere();
+}
+
+/// `CASE case_operand case_exprlist case_else END`.
+fn parseCase(p: *Parse) Error!Node.Index {
+    const case = p.nextToken();
+    const operand: u32 = if (p.peek() == .keyword_when) 0 else @backingInt(try p.parseExpr(0));
+    var clauses: std.ArrayList(u32) = .empty;
+    defer clauses.deinit(p.gpa);
+    try clauses.appendSlice(p.gpa, &.{ 0, 0 });
+    while (p.eat(.keyword_when)) {
+        try clauses.append(p.gpa, @backingInt(try p.parseExpr(0)));
+        if (!p.eat(.keyword_then)) return p.failHere();
+        try clauses.append(p.gpa, @backingInt(try p.parseExpr(0)));
+        clauses.items[1] += 1;
+    }
+    if (clauses.items[1] == 0) return p.failHere();
+    if (p.eat(.keyword_else)) clauses.items[0] = @backingInt(try p.parseExpr(0));
+    if (!p.eat(.keyword_end)) return p.failHere();
+    return p.addNode(.{
+        .tag = .case,
+        .main_token = case,
+        .data = .{ .lhs = operand, .rhs = try p.addExtra(clauses.items) },
+    });
+}
+
+/// `RAISE LP IGNORE RP` or `RAISE LP raisetype COMMA nm RP`.
+fn parseRaise(p: *Parse) Error!Node.Index {
+    const raise = p.nextToken();
+    if (!p.eat(.l_paren)) return p.failHere();
+    const kind = p.peek();
+    const kind_token = p.tok_i;
+    switch (kind) {
+        .keyword_ignore, .keyword_rollback, .keyword_abort, .keyword_fail => _ = p.nextToken(),
+        else => return p.failHere(),
+    }
+    var message: u32 = 0;
+    if (kind != .keyword_ignore) {
+        if (!p.eat(.comma)) return p.failHere();
+        message = try p.parseName(.nm);
+    }
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addNode(.{
+        .tag = .raise,
+        .main_token = raise,
+        .data = .{ .lhs = kind_token, .rhs = message },
+    });
+}
+
+/// `idj LP distinct exprlist [ORDER BY sortlist] RP` or `idj LP STAR RP`, at the name.
+fn parseCall(p: *Parse) Error!Node.Index {
+    const name = p.nextToken();
+    _ = p.nextToken();
+    if (p.eat(.star)) {
+        if (!p.eat(.r_paren)) return p.failHere();
+        return p.addNode(.{ .tag = .call_star, .main_token = name, .data = .{ .lhs = 0, .rhs = 0 } });
+    }
+    const quantifier: u32 = if (p.eat(.keyword_distinct))
+        Node.call_distinct
+    else if (p.eat(.keyword_all))
+        Node.call_all
+    else
+        0;
+    var parts: std.ArrayList(u32) = .empty;
+    defer parts.deinit(p.gpa);
+    try parts.append(p.gpa, quantifier);
+    try p.parseExprListBody(&parts);
+    const order_at = parts.items.len;
+    try parts.append(p.gpa, 0);
+    if (p.eat(.keyword_order)) {
+        if (!p.eat(.keyword_by)) return p.failHere();
+        while (true) {
+            try parts.append(p.gpa, @backingInt(try p.parseOrderItem()));
+            if (!p.eat(.comma)) break;
+        }
+        parts.items[order_at] = @intCast(parts.items.len - order_at - 1);
+    }
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addNode(.{
+        .tag = .call,
+        .main_token = name,
+        .data = .{ .lhs = try p.addExtra(parts.items), .rhs = 0 },
+    });
+}
+
+/// `expr sortorder nulls`.
+fn parseOrderItem(p: *Parse) Error!Node.Index {
+    const first: TokenIndex = @fromBackingInt(p.tok_i);
+    const expr = try p.parseExpr(0);
+    var flags: Node.SortFlags = .{ .direction = .default, .nulls = .default };
+    if (p.eat(.keyword_asc)) {
+        flags.direction = .asc;
+    } else if (p.eat(.keyword_desc)) {
+        flags.direction = .desc;
+    }
+    if (p.eat(.keyword_nulls)) {
+        if (p.eat(.keyword_first)) {
+            flags.nulls = .first;
+        } else if (p.eat(.keyword_last)) {
+            flags.nulls = .last;
+        } else return p.failHere();
+    }
+    return p.addNode(.{
+        .tag = .order_item,
+        .main_token = first,
+        .data = .{ .lhs = @backingInt(expr), .rhs = @bitCast(flags) },
+    });
 }
 
 /// `LP expr RP` or `LP nexprlist COMMA expr RP`.

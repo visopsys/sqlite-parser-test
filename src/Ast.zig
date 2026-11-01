@@ -50,6 +50,17 @@ pub const Node = struct {
         _,
     };
 
+    /// The values of `Tag.call`'s quantifier.
+    pub const call_distinct = 1;
+    pub const call_all = 2;
+
+    /// `Tag.order_item`'s sort options, packed into `Data.rhs`.
+    pub const SortFlags = packed struct(u32) {
+        direction: enum(u2) { default, asc, desc },
+        nulls: enum(u2) { default, first, last },
+        _: u28 = 0,
+    };
+
     pub const Tag = enum {
         /// The statement list. `lhs..rhs` is the range of `extra_data` holding the
         /// statement nodes. `main_token` is the first token.
@@ -128,6 +139,26 @@ pub const Node = struct {
         /// `rhs` is the `extra_data` index of the same two tokens, then the argument count
         /// and the argument nodes.
         in_func,
+        /// `CAST(lhs AS type)`. `main_token` is `CAST`. `rhs` is the `extra_data` index of
+        /// the first and the end token of the type; the end is the closing parenthesis.
+        /// The type is the tokens between them, as `typetoken` gives them.
+        cast,
+        /// `CASE [operand] WHEN .. THEN .. [ELSE ..] END`. `main_token` is `CASE`. `lhs` is
+        /// the operand node or 0. `rhs` is the `extra_data` index of the `ELSE` node (0 when
+        /// absent), the number of `WHEN` pairs and the pairs' nodes, condition first.
+        case,
+        /// `RAISE(IGNORE)` or `RAISE(kind, message)`. `main_token` is `RAISE`. `lhs` is the
+        /// kind token and `rhs` the message name token, 0 for `IGNORE`.
+        raise,
+        /// `name([DISTINCT | ALL] args [ORDER BY items])`. `main_token` is the name. `lhs`
+        /// is the `extra_data` index of the quantifier (`call_distinct` or `call_all`, else
+        /// 0), the argument count, the arguments, the item count and the `order_item` nodes.
+        call,
+        /// `name(*)`. `main_token` is the name.
+        call_star,
+        /// `expr [ASC | DESC] [NULLS FIRST | LAST]` in a call's `ORDER BY`. `lhs` is the
+        /// expression. `rhs` is the `SortFlags` as an integer.
+        order_item,
     };
 };
 
@@ -300,6 +331,12 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .in_list,
         .in_table,
         .in_func,
+        .cast,
+        .case,
+        .raise,
+        .call,
+        .call_star,
+        .order_item,
         => unreachable,
     }
 }
@@ -381,7 +418,99 @@ fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
             try self.renderOperands(n, writer);
             try writer.writeByte(')');
         },
+        .cast => {
+            const type_tokens = self.extra_data[n.data.rhs..][0..2];
+            try writer.writeAll("CAST(");
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeAll(" AS");
+            try self.renderType(type_tokens[0], type_tokens[1], writer);
+            try writer.writeByte(')');
+        },
+        .case => {
+            const clauses = self.extra_data[n.data.rhs..];
+            try writer.writeAll("CASE");
+            if (n.data.lhs != 0) {
+                try writer.writeByte(' ');
+                try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            }
+            for (0..clauses[1]) |i| {
+                try writer.writeAll(" WHEN ");
+                try self.renderExpr(@fromBackingInt(@intCast(clauses[2 + 2 * i])), writer);
+                try writer.writeAll(" THEN ");
+                try self.renderExpr(@fromBackingInt(@intCast(clauses[3 + 2 * i])), writer);
+            }
+            if (clauses[0] != 0) {
+                try writer.writeAll(" ELSE ");
+                try self.renderExpr(@fromBackingInt(@intCast(clauses[0])), writer);
+            }
+            try writer.writeAll(" END");
+        },
+        .raise => {
+            try writer.writeAll("RAISE(");
+            try writeUpper(self.tokenText(@fromBackingInt(n.data.lhs)), writer);
+            if (n.data.rhs != 0) {
+                try writer.writeAll(", ");
+                try self.renderName(n.data.rhs, writer);
+            }
+            try writer.writeByte(')');
+        },
+        .call_star => {
+            try self.renderName(main_token, writer);
+            try writer.writeAll("(*)");
+        },
+        .call => {
+            const parts = self.extra_data[n.data.lhs..];
+            const args = parts[2..][0..parts[1]];
+            const order = parts[2 + args.len ..];
+            try self.renderName(main_token, writer);
+            try writer.writeByte('(');
+            switch (parts[0]) {
+                Node.call_distinct => try writer.writeAll("DISTINCT "),
+                Node.call_all => try writer.writeAll("ALL "),
+                else => {},
+            }
+            for (args, 0..) |arg, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try self.renderExpr(@fromBackingInt(@intCast(arg)), writer);
+            }
+            for (order[1..][0..order[0]], 0..) |item, i| {
+                try writer.writeAll(if (i == 0) " ORDER BY " else ", ");
+                try self.renderExpr(@fromBackingInt(@intCast(item)), writer);
+            }
+            try writer.writeByte(')');
+        },
+        .order_item => {
+            const flags: Node.SortFlags = @bitCast(n.data.rhs);
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeAll(switch (flags.direction) {
+                .default => "",
+                .asc => " ASC",
+                .desc => " DESC",
+            });
+            try writer.writeAll(switch (flags.nulls) {
+                .default => "",
+                .first => " NULLS FIRST",
+                .last => " NULLS LAST",
+            });
+        },
         else => unreachable,
+    }
+}
+
+/// Writes the type of a `cast` node: each name after a space, then the optional
+/// parenthesized sizes. The tokens run from `first` up to, not including, `end`.
+fn renderType(self: Ast, first: u32, end: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const tags = self.tokens.items(.tag);
+    for (first..end) |i| {
+        const token: TokenIndex = @fromBackingInt(@intCast(i));
+        switch (tags[i]) {
+            .l_paren, .r_paren, .plus, .minus, .integer_literal, .float_literal => try writer.writeAll(self.tokenText(token)),
+            .comma => try writer.writeAll(", "),
+            else => {
+                try writer.writeByte(' ');
+                try self.renderName(@intCast(i), writer);
+            },
+        }
     }
 }
 
@@ -905,4 +1034,67 @@ test "expression syntax errors" {
     try expectError("SELECT * x", "near \"x\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
     try expectError("SELECT select", "near \"select\": syntax error", .{ .byte_offset = 7, .line = 1, .column = 8 });
     try expectError("SELECT 1 + \x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 11, .line = 1, .column = 12 });
+}
+
+test "CAST" {
+    try expectRender("SELECT CAST(x AS INT)", "SELECT CAST(x AS INT);\n");
+    try expectRender("select cast(1+2 as DECIMAL(10, 2))", "SELECT CAST((1 + 2) AS DECIMAL(10, 2));\n");
+    try expectRender("SELECT CAST(x AS UNSIGNED BIG INT)", "SELECT CAST(x AS UNSIGNED BIG INT);\n");
+    try expectRender("SELECT CAST(x AS VARCHAR(10))", "SELECT CAST(x AS VARCHAR(10));\n");
+    try expectRender("SELECT CAST(x AS DECIMAL(10, -2))", "SELECT CAST(x AS DECIMAL(10, -2));\n");
+    try expectRender("SELECT CAST(x AS T(+1.5, 2))", "SELECT CAST(x AS T(+1.5, 2));\n");
+    try expectRender("SELECT CAST(x AS 'my type' int)", "SELECT CAST(x AS \"my type\" int);\n");
+    try expectRender("SELECT CAST(x AS)", "SELECT CAST(x AS);\n");
+    try expectRender("SELECT CAST(a + b AS INT) * 2", "SELECT (CAST((a + b) AS INT) * 2);\n");
+}
+
+test "CASE" {
+    try expectRender("SELECT CASE WHEN a THEN b END", "SELECT CASE WHEN a THEN b END;\n");
+    try expectRender("SELECT CASE x WHEN 1 THEN 2 WHEN 3 THEN 4 ELSE 5 END", "SELECT CASE x WHEN 1 THEN 2 WHEN 3 THEN 4 ELSE 5 END;\n");
+    try expectRender("SELECT CASE WHEN a OR b THEN c + 1 ELSE d AND e END", "SELECT CASE WHEN (a OR b) THEN (c + 1) ELSE (d AND e) END;\n");
+    try expectRender("SELECT CASE end WHEN 1 THEN 2 END", "SELECT CASE \"end\" WHEN 1 THEN 2 END;\n");
+}
+
+test "RAISE" {
+    try expectRender("SELECT RAISE(IGNORE)", "SELECT RAISE(IGNORE);\n");
+    try expectRender("SELECT raise(abort, 'no way')", "SELECT RAISE(ABORT, \"no way\");\n");
+    try expectRender("SELECT RAISE(ROLLBACK, msg)", "SELECT RAISE(ROLLBACK, msg);\n");
+    try expectRender("SELECT RAISE(FAIL, 'x')", "SELECT RAISE(FAIL, x);\n");
+}
+
+test "function calls" {
+    try expectRender("SELECT f(), g(*), h(1, a + 2)", "SELECT f(), g(*), h(1, (a + 2));\n");
+    try expectRender("SELECT count(DISTINCT a, b), count(ALL a)", "SELECT count(DISTINCT a, b), count(ALL a);\n");
+    try expectRender("SELECT group_concat(a ORDER BY b DESC)", "SELECT group_concat(a ORDER BY b DESC);\n");
+    try expectRender(
+        "SELECT f(a, b ORDER BY c ASC NULLS FIRST, d NULLS LAST, e)",
+        "SELECT f(a, b ORDER BY c ASC NULLS FIRST, d NULLS LAST, e);\n",
+    );
+    try expectRender("SELECT f(DISTINCT)", "SELECT f(DISTINCT );\n");
+    try expectRender("SELECT left(a, 1), replace(a, b, c), \"x\"(1), cross(1), indexed(2)", "SELECT \"left\"(a, 1), \"replace\"(a, b, c), x(1), \"cross\"(1), \"indexed\"(2);\n");
+    try expectRender("SELECT f(a) + g(b) * 2", "SELECT (f(a) + (g(b) * 2));\n");
+}
+
+test "CAST, CASE, RAISE and call syntax errors" {
+    try expectError("SELECT CAST(1)", "near \")\": syntax error", .{ .byte_offset = 13, .line = 1, .column = 14 });
+    try expectError("SELECT CAST(1 AS", "incomplete input", .{ .byte_offset = 16, .line = 1, .column = 17 });
+    try expectError("SELECT CAST(1 AS (2))", "near \"(\": syntax error", .{ .byte_offset = 17, .line = 1, .column = 18 });
+    try expectError("SELECT CAST(1 AS T(x))", "near \"x\": syntax error", .{ .byte_offset = 19, .line = 1, .column = 20 });
+    try expectError("SELECT CAST(1 AS T(1, 2, 3))", "near \",\": syntax error", .{ .byte_offset = 23, .line = 1, .column = 24 });
+    try expectError("SELECT CAST", "incomplete input", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("SELECT CASE END", "incomplete input", .{ .byte_offset = 15, .line = 1, .column = 16 });
+    try expectError("SELECT CASE WHEN a END", "near \"END\": syntax error", .{ .byte_offset = 19, .line = 1, .column = 20 });
+    try expectError("SELECT CASE WHEN a THEN b", "incomplete input", .{ .byte_offset = 25, .line = 1, .column = 26 });
+    try expectError("SELECT CASE\n  ELSE 1 END", "near \"ELSE\": syntax error", .{ .byte_offset = 14, .line = 2, .column = 3 });
+    try expectError("SELECT RAISE(ABORT)", "near \")\": syntax error", .{ .byte_offset = 18, .line = 1, .column = 19 });
+    try expectError("SELECT RAISE(IGNORE, 'x')", "near \",\": syntax error", .{ .byte_offset = 19, .line = 1, .column = 20 });
+    try expectError("SELECT RAISE(ABORT, 1)", "near \"1\": syntax error", .{ .byte_offset = 20, .line = 1, .column = 21 });
+    try expectError("SELECT RAISE(x)", "near \"x\": syntax error", .{ .byte_offset = 13, .line = 1, .column = 14 });
+    try expectError("SELECT RAISE", "incomplete input", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("SELECT f(*, 1)", "near \",\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("SELECT f(a,)", "near \")\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("SELECT f(a ORDER b)", "near \"b\": syntax error", .{ .byte_offset = 17, .line = 1, .column = 18 });
+    try expectError("SELECT f(a ORDER BY b NULLS)", "near \")\": syntax error", .{ .byte_offset = 27, .line = 1, .column = 28 });
+    try expectError("SELECT f(a) OVER (x)", "near \"OVER\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("SELECT 'f'(1)", "near \"(\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
 }

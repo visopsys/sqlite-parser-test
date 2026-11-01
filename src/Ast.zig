@@ -100,6 +100,34 @@ pub const Node = struct {
         binary,
         /// `lhs IS NOT rhs`. `main_token` is `IS`.
         is_not,
+        /// `lhs IS DISTINCT FROM rhs`, laid out like `is_not`.
+        is_distinct,
+        /// `lhs IS NOT DISTINCT FROM rhs`, laid out like `is_not`.
+        is_not_distinct,
+        /// `lhs COLLATE name`. `rhs` is the name token. `main_token` is `COLLATE`.
+        collate,
+        /// `lhs ISNULL`. `main_token` is `ISNULL`.
+        is_null,
+        /// `lhs NOTNULL` or `lhs NOT NULL`. `main_token` is `NOTNULL` or `NULL`.
+        not_null,
+        /// `lhs [NOT] LIKE|GLOB|REGEXP|MATCH pattern [ESCAPE escape]`. `main_token` is the
+        /// operator keyword; the token before it is `NOT` when the operator is negated.
+        /// `rhs` is the `extra_data` index of the pattern node and the escape node, which
+        /// is 0 when there is no `ESCAPE` (no expression is node 0, the root).
+        like,
+        /// `lhs [NOT] BETWEEN low AND high`. `main_token` is `BETWEEN`, negated as for
+        /// `like`. `rhs` is the `extra_data` index of the `low` and `high` nodes.
+        between,
+        /// `lhs [NOT] IN (items)`. `main_token` is `IN`, negated as for `like`. `rhs` is
+        /// the `extra_data` index of the item count followed by the item nodes.
+        in_list,
+        /// `lhs [NOT] IN name` or `IN schema.name`. `main_token` is `IN`. `rhs` is the
+        /// `extra_data` index of the name token and the token after the dot, or 0.
+        in_table,
+        /// `lhs [NOT] IN name(args)` or `IN schema.name(args)`. `main_token` is `IN`.
+        /// `rhs` is the `extra_data` index of the same two tokens, then the argument count
+        /// and the argument nodes.
+        in_func,
     };
 };
 
@@ -262,6 +290,16 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .unary,
         .binary,
         .is_not,
+        .is_distinct,
+        .is_not_distinct,
+        .collate,
+        .is_null,
+        .not_null,
+        .like,
+        .between,
+        .in_list,
+        .in_table,
+        .in_func,
         => unreachable,
     }
 }
@@ -306,18 +344,84 @@ fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
             try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(')');
         },
-        .binary, .is_not => {
+        .binary, .is_not, .is_distinct, .is_not_distinct => {
             try writer.writeByte('(');
             try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(' ');
             try writeUpper(self.tokens.items(.tag)[main_token].symbol(), writer);
-            if (n.tag == .is_not) try writer.writeAll(" NOT");
+            try writer.writeAll(switch (n.tag) {
+                .is_not => " NOT",
+                .is_distinct => " DISTINCT FROM",
+                .is_not_distinct => " NOT DISTINCT FROM",
+                else => "",
+            });
             try writer.writeByte(' ');
             try self.renderExpr(@fromBackingInt(@intCast(n.data.rhs)), writer);
             try writer.writeByte(')');
         },
+        .collate => {
+            try writer.writeByte('(');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeAll(" COLLATE ");
+            try self.renderName(n.data.rhs, writer);
+            try writer.writeByte(')');
+        },
+        .is_null, .not_null => {
+            try writer.writeByte('(');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeAll(if (n.tag == .is_null) " ISNULL)" else " NOTNULL)");
+        },
+        .like, .between, .in_list, .in_table, .in_func => {
+            try writer.writeByte('(');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeByte(' ');
+            if (self.tokens.items(.tag)[main_token - 1] == .keyword_not) try writer.writeAll("NOT ");
+            try writeUpper(self.tokenText(n.main_token), writer);
+            try writer.writeByte(' ');
+            try self.renderOperands(n, writer);
+            try writer.writeByte(')');
+        },
         else => unreachable,
     }
+}
+
+/// Writes what follows the operator keyword of a `like`, `between`, `in_list`,
+/// `in_table` or `in_func` node.
+fn renderOperands(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const operands = self.extra_data[n.data.rhs..];
+    switch (n.tag) {
+        .like => {
+            try self.renderExpr(@fromBackingInt(@intCast(operands[0])), writer);
+            if (operands[1] == 0) return;
+            try writer.writeAll(" ESCAPE ");
+            try self.renderExpr(@fromBackingInt(@intCast(operands[1])), writer);
+        },
+        .between => {
+            try self.renderExpr(@fromBackingInt(@intCast(operands[0])), writer);
+            try writer.writeAll(" AND ");
+            try self.renderExpr(@fromBackingInt(@intCast(operands[1])), writer);
+        },
+        .in_list => try self.renderExprList(operands, writer),
+        .in_table, .in_func => {
+            try self.renderName(operands[0], writer);
+            if (operands[1] != 0) {
+                try writer.writeByte('.');
+                try self.renderName(operands[1], writer);
+            }
+            if (n.tag == .in_func) try self.renderExprList(operands[2..], writer);
+        },
+        else => unreachable,
+    }
+}
+
+/// Writes `(a, b, ...)` for a count followed by that many expression nodes.
+fn renderExprList(self: Ast, counted: []const u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeByte('(');
+    for (counted[1..][0..counted[0]], 0..) |item, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try self.renderExpr(@fromBackingInt(@intCast(item)), writer);
+    }
+    try writer.writeByte(')');
 }
 
 fn writeUpper(text: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -654,6 +758,107 @@ test "operators of one level associate to the left" {
     try expectRender("SELECT a IS NOT b IS c", "SELECT ((a IS NOT b) IS c);\n");
     try expectRender("SELECT a IS NOT NOT b", "SELECT (a IS NOT (NOT b));\n");
     try expectRender("SELECT (a OR b) AND c", "SELECT ((a OR b) AND c);\n");
+}
+
+test "COLLATE, ISNULL and NOTNULL" {
+    try expectRender("SELECT a COLLATE x, a collate 'y z', a COLLATE x COLLATE nocase", "SELECT (a COLLATE x), (a COLLATE \"y z\"), ((a COLLATE x) COLLATE nocase);\n");
+    try expectRender("SELECT a ISNULL, a NOTNULL, a NOT NULL, a ISNULL ISNULL", "SELECT (a ISNULL), (a NOTNULL), (a NOTNULL), ((a ISNULL) ISNULL);\n");
+}
+
+test "LIKE family" {
+    try expectRender(
+        "SELECT a LIKE b, a glob b, a REGEXP b, a MATCH b, a NOT LIKE b, a not glob b, a NOT REGEXP b, a NOT MATCH b",
+        "SELECT (a LIKE b), (a GLOB b), (a REGEXP b), (a MATCH b), (a NOT LIKE b), (a NOT GLOB b), (a NOT REGEXP b), (a NOT MATCH b);\n",
+    );
+    try expectRender("SELECT a LIKE b ESCAPE c, a NOT LIKE b ESCAPE c", "SELECT (a LIKE b ESCAPE c), (a NOT LIKE b ESCAPE c);\n");
+}
+
+test "IS forms" {
+    try expectRender(
+        "SELECT a IS b, a IS NOT b, a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b, a is null, a is not null",
+        "SELECT (a IS b), (a IS NOT b), (a IS DISTINCT FROM b), (a IS NOT DISTINCT FROM b), (a IS NULL), (a IS NOT NULL);\n",
+    );
+}
+
+test "BETWEEN" {
+    try expectRender("SELECT a BETWEEN b AND c, a NOT BETWEEN b AND c", "SELECT (a BETWEEN b AND c), (a NOT BETWEEN b AND c);\n");
+}
+
+test "IN" {
+    try expectRender(
+        "SELECT a IN (b, c), a NOT IN (b), a IN (), a NOT IN (), (a, b) IN ((1, 2), (3, 4))",
+        "SELECT (a IN (b, c)), (a NOT IN (b)), (a IN ()), (a NOT IN ()), ((a, b) IN ((1, 2), (3, 4)));\n",
+    );
+    try expectRender(
+        "SELECT a IN t, a NOT IN s.t, a IN f(), a IN f(1, 2), a NOT IN s.f(b), a IN 'q'.left, a IN left",
+        "SELECT (a IN t), (a NOT IN s.t), (a IN f()), (a IN f(1, 2)), (a NOT IN s.f(b)), (a IN q.\"left\"), (a IN \"left\");\n",
+    );
+}
+
+test "precedence of the special operators" {
+    try expectRender("SELECT a = b ISNULL", "SELECT ((a = b) ISNULL);\n");
+    try expectRender("SELECT a + b ISNULL", "SELECT ((a + b) ISNULL);\n");
+    try expectRender("SELECT a AND b ISNULL", "SELECT (a AND (b ISNULL));\n");
+    try expectRender("SELECT a NOT NULL = b", "SELECT ((a NOTNULL) = b);\n");
+    try expectRender("SELECT NOT a NOT NULL", "SELECT (NOT (a NOTNULL));\n");
+    try expectRender("SELECT a IS b = c", "SELECT ((a IS b) = c);\n");
+    try expectRender("SELECT a = b IS c", "SELECT ((a = b) IS c);\n");
+    try expectRender("SELECT a IS NOT b = c", "SELECT ((a IS NOT b) = c);\n");
+    try expectRender("SELECT a IS NOT DISTINCT FROM b = c", "SELECT ((a IS NOT DISTINCT FROM b) = c);\n");
+    try expectRender("SELECT a IS b < c", "SELECT (a IS (b < c));\n");
+    try expectRender("SELECT a < b IS c", "SELECT ((a < b) IS c);\n");
+    try expectRender("SELECT a LIKE b = c", "SELECT ((a LIKE b) = c);\n");
+    try expectRender("SELECT a = b LIKE c", "SELECT ((a = b) LIKE c);\n");
+    try expectRender("SELECT a LIKE b LIKE c", "SELECT ((a LIKE b) LIKE c);\n");
+    try expectRender("SELECT a LIKE b < c", "SELECT (a LIKE (b < c));\n");
+    try expectRender("SELECT a LIKE b ESCAPE c || d", "SELECT (a LIKE b ESCAPE (c || d));\n");
+    try expectRender("SELECT a LIKE b ESCAPE c = d", "SELECT ((a LIKE b ESCAPE c) = d);\n");
+    try expectRender("SELECT a LIKE b + c ESCAPE d", "SELECT (a LIKE (b + c) ESCAPE d);\n");
+    try expectRender("SELECT a AND b LIKE c", "SELECT (a AND (b LIKE c));\n");
+    try expectRender("SELECT a COLLATE x + 1", "SELECT ((a COLLATE x) + 1);\n");
+    try expectRender("SELECT 1 + a COLLATE x", "SELECT (1 + (a COLLATE x));\n");
+    try expectRender("SELECT a || b COLLATE x", "SELECT (a || (b COLLATE x));\n");
+    try expectRender("SELECT - a COLLATE x", "SELECT ((-a) COLLATE x);\n");
+    try expectRender("SELECT ~ a COLLATE x", "SELECT ((~a) COLLATE x);\n");
+    try expectRender("SELECT a NOT IN b", "SELECT (a NOT IN b);\n");
+    try expectRender("SELECT a IN (b) = c", "SELECT ((a IN (b)) = c);\n");
+    try expectRender("SELECT a = b IN (c)", "SELECT ((a = b) IN (c));\n");
+    try expectRender("SELECT a IN (b) IN (c)", "SELECT ((a IN (b)) IN (c));\n");
+    try expectRender("SELECT a OR b IN (c)", "SELECT (a OR (b IN (c)));\n");
+    try expectRender("SELECT a + b IN (c)", "SELECT ((a + b) IN (c));\n");
+}
+
+test "BETWEEN takes the first AND" {
+    try expectRender("SELECT a BETWEEN b AND c AND d", "SELECT ((a BETWEEN b AND c) AND d);\n");
+    try expectRender("SELECT a BETWEEN b + 1 AND c OR d", "SELECT ((a BETWEEN (b + 1) AND c) OR d);\n");
+    try expectRender("SELECT a BETWEEN b AND c + 1", "SELECT (a BETWEEN b AND (c + 1));\n");
+    try expectRender("SELECT a BETWEEN b AND c = d", "SELECT ((a BETWEEN b AND c) = d);\n");
+    try expectRender("SELECT a = b BETWEEN c AND d", "SELECT ((a = b) BETWEEN c AND d);\n");
+    try expectRender("SELECT a BETWEEN b = c AND d", "SELECT (a BETWEEN (b = c) AND d);\n");
+    try expectRender("SELECT a BETWEEN NOT b AND c", "SELECT (a BETWEEN (NOT b) AND c);\n");
+    try expectRender("SELECT a AND b BETWEEN c AND d", "SELECT (a AND (b BETWEEN c AND d));\n");
+    try expectRender("SELECT NOT a BETWEEN b AND c", "SELECT (NOT (a BETWEEN b AND c));\n");
+    try expectRender("SELECT a BETWEEN b BETWEEN c AND d AND e", "SELECT (a BETWEEN (b BETWEEN c AND d) AND e);\n");
+}
+
+test "special operator syntax errors" {
+    try expectError("SELECT 1 NOT 2", "near \"2\": syntax error", .{ .byte_offset = 13, .line = 1, .column = 14 });
+    try expectError("SELECT 1 NOT", "incomplete input", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("SELECT 1 BETWEEN 2", "incomplete input", .{ .byte_offset = 18, .line = 1, .column = 19 });
+    try expectError("SELECT 1 BETWEEN 2 OR 3", "incomplete input", .{ .byte_offset = 23, .line = 1, .column = 24 });
+    try expectError("SELECT 1 IN (", "incomplete input", .{ .byte_offset = 13, .line = 1, .column = 14 });
+    try expectError("SELECT 1 IN (1,)", "near \")\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
+    try expectError("SELECT 1 IN 2", "near \"2\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("SELECT 1 IN a.b.c", "near \".\": syntax error", .{ .byte_offset = 15, .line = 1, .column = 16 });
+    try expectError("SELECT 1 IN (SELECT 1)", "near \"SELECT\": syntax error", .{ .byte_offset = 13, .line = 1, .column = 14 });
+    try expectError("SELECT 1 IS DISTINCT 2", "near \"2\": syntax error", .{ .byte_offset = 21, .line = 1, .column = 22 });
+    try expectError("SELECT 1 IS NOT DISTINCT 2", "near \"2\": syntax error", .{ .byte_offset = 25, .line = 1, .column = 26 });
+    try expectError("SELECT 1 IS DISTINCT FROM", "incomplete input", .{ .byte_offset = 25, .line = 1, .column = 26 });
+    try expectError("SELECT 1 COLLATE x.y", "near \".\": syntax error", .{ .byte_offset = 18, .line = 1, .column = 19 });
+    try expectError("SELECT 1 COLLATE", "incomplete input", .{ .byte_offset = 16, .line = 1, .column = 17 });
+    try expectError("SELECT 1 NOT NULL NOT NOT", "near \"NOT\": syntax error", .{ .byte_offset = 22, .line = 1, .column = 23 });
+    try expectError("SELECT 1 LIKE 2 ESCAPE 3 ESCAPE 4", "near \"ESCAPE\": syntax error", .{ .byte_offset = 25, .line = 1, .column = 26 });
+    try expectError("SELECT 1 = 2 ESCAPE 3", "near \"ESCAPE\": syntax error", .{ .byte_offset = 13, .line = 1, .column = 14 });
 }
 
 test "a long chain of operators does not recurse per operator" {

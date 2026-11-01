@@ -181,12 +181,24 @@ fn infixLevel(tag: Token.Tag) ?Level {
     return switch (tag) {
         .keyword_or => .logical_or,
         .keyword_and => .logical_and,
-        .keyword_is, .equal, .equal_equal, .not_equal => .equality,
+        .keyword_is,
+        .keyword_not,
+        .keyword_like_kw,
+        .keyword_match,
+        .keyword_between,
+        .keyword_in,
+        .keyword_isnull,
+        .keyword_notnull,
+        .equal,
+        .equal_equal,
+        .not_equal,
+        => .equality,
         .l_angle_bracket, .angle_bracket_left_equal, .r_angle_bracket, .angle_bracket_right_equal => .comparison,
         .ampersand, .pipe, .angle_bracket_left_angle_bracket_left, .angle_bracket_right_angle_bracket_right => .bitwise,
         .plus, .minus => .additive,
         .star, .slash, .percent => .multiplicative,
         .pipe_pipe, .arrow, .arrow2 => .concat,
+        .keyword_collate => .collate,
         else => null,
     };
 }
@@ -194,22 +206,132 @@ fn infixLevel(tag: Token.Tag) ?Level {
 /// Parses an expression whose infix operators all bind at least as tightly as `min_bp`.
 /// A chain of operators of one level loops here instead of recursing.
 fn parseExpr(p: *Parse, min_bp: u8) Error!Node.Index {
+    return p.parseOperators(min_bp, false);
+}
+
+/// With `and_ends_expr` the expression stops at an `AND` between its own operands, which
+/// is how the first `AND` after `BETWEEN expr` is left to `BETWEEN`. An `AND` inside the
+/// right operand of a looser operator (`OR`) still belongs to that operand.
+fn parseOperators(p: *Parse, min_bp: u8, and_ends_expr: bool) Error!Node.Index {
     try p.enter();
     defer p.leave();
     var lhs = try p.parsePrimary();
     while (infixLevel(p.peek())) |level| {
         if (level.left() < min_bp) break;
-        const is_op = p.peek() == .keyword_is;
-        const op = p.nextToken();
-        const tag: Node.Tag = if (is_op and p.eat(.keyword_not)) .is_not else .binary;
-        const rhs = try p.parseExpr(level.right());
-        lhs = try p.addNode(.{
-            .tag = tag,
-            .main_token = op,
-            .data = .{ .lhs = @backingInt(lhs), .rhs = @backingInt(rhs) },
-        });
+        if (and_ends_expr and p.peek() == .keyword_and) break;
+        lhs = try p.parseOperator(lhs, level);
     }
     return lhs;
+}
+
+/// Parses the operator at the current token, which is an infix operator of `level`, and
+/// the operands that follow `lhs`.
+fn parseOperator(p: *Parse, lhs: Node.Index, level: Level) Error!Node.Index {
+    switch (p.peek()) {
+        .keyword_collate => {
+            const op = p.nextToken();
+            const name = try p.parseName(.ids);
+            return p.addBinary(.collate, op, lhs, name);
+        },
+        .keyword_isnull, .keyword_notnull => |tag| {
+            const op = p.nextToken();
+            return p.addBinary(if (tag == .keyword_isnull) .is_null else .not_null, op, lhs, 0);
+        },
+        .keyword_is => return p.parseIs(lhs),
+        .keyword_not, .keyword_like_kw, .keyword_match, .keyword_between, .keyword_in => return p.parseNegatable(lhs),
+        else => {
+            const op = p.nextToken();
+            const rhs = try p.parseExpr(level.right());
+            return p.addBinary(.binary, op, lhs, @backingInt(rhs));
+        },
+    }
+}
+
+/// `IS [NOT] [DISTINCT FROM] expr`. `IS NOT` always takes the `NOT` as part of the
+/// operator, never as a prefix operator of the right operand.
+fn parseIs(p: *Parse, lhs: Node.Index) Error!Node.Index {
+    const op = p.nextToken();
+    const negated = p.eat(.keyword_not);
+    const distinct = p.eat(.keyword_distinct);
+    if (distinct and !p.eat(.keyword_from)) return p.failHere();
+    const rhs = try p.parseExpr(Level.equality.right());
+    const tag: Node.Tag = if (distinct)
+        (if (negated) .is_not_distinct else .is_distinct)
+    else if (negated) .is_not else .binary;
+    return p.addBinary(tag, op, lhs, @backingInt(rhs));
+}
+
+/// The operators that `NOT` may precede: `[NOT] LIKE|GLOB|REGEXP|MATCH`, `[NOT] BETWEEN`,
+/// `[NOT] IN` and `NOT NULL`.
+fn parseNegatable(p: *Parse, lhs: Node.Index) Error!Node.Index {
+    _ = p.eat(.keyword_not);
+    const op: TokenIndex = @fromBackingInt(p.tok_i);
+    switch (p.peek()) {
+        .keyword_null => {
+            _ = p.nextToken();
+            return p.addBinary(.not_null, op, lhs, 0);
+        },
+        .keyword_like_kw, .keyword_match => {
+            _ = p.nextToken();
+            const operand_bp = Level.equality.right();
+            const pattern = try p.parseExpr(operand_bp);
+            const escape: u32 = if (p.eat(.keyword_escape)) @backingInt(try p.parseExpr(operand_bp)) else 0;
+            const operands = try p.addExtra(&.{ @backingInt(pattern), escape });
+            return p.addBinary(.like, op, lhs, operands);
+        },
+        .keyword_between => {
+            _ = p.nextToken();
+            const low = try p.parseOperators(0, true);
+            if (!p.eat(.keyword_and)) return p.failHere();
+            const high = try p.parseExpr(Level.equality.right());
+            const operands = try p.addExtra(&.{ @backingInt(low), @backingInt(high) });
+            return p.addBinary(.between, op, lhs, operands);
+        },
+        .keyword_in => {
+            _ = p.nextToken();
+            return p.parseInOperand(op, lhs);
+        },
+        else => return p.failHere(),
+    }
+}
+
+/// What follows `IN`: `(exprlist)`, `name`, `schema.name` or either name with a
+/// parenthesized argument list.
+fn parseInOperand(p: *Parse, op: TokenIndex, lhs: Node.Index) Error!Node.Index {
+    var operands: std.ArrayList(u32) = .empty;
+    defer operands.deinit(p.gpa);
+    if (p.eat(.l_paren)) {
+        try p.parseCountedExprList(&operands);
+        return p.addBinary(.in_list, op, lhs, try p.addExtra(operands.items));
+    }
+    try operands.append(p.gpa, try p.parseName(.nm));
+    try operands.append(p.gpa, if (p.eat(.dot)) try p.parseName(.nm) else 0);
+    if (!p.eat(.l_paren)) return p.addBinary(.in_table, op, lhs, try p.addExtra(operands.items));
+    try p.parseCountedExprList(&operands);
+    return p.addBinary(.in_func, op, lhs, try p.addExtra(operands.items));
+}
+
+/// `exprlist RP`, after the left parenthesis: appends the number of expressions to `list`
+/// and then the expressions.
+fn parseCountedExprList(p: *Parse, list: *std.ArrayList(u32)) Error!void {
+    const count_at = list.items.len;
+    try list.append(p.gpa, 0);
+    if (p.peek() != .r_paren) {
+        while (true) {
+            try list.append(p.gpa, @backingInt(try p.parseExpr(0)));
+            if (!p.eat(.comma)) break;
+        }
+    }
+    if (!p.eat(.r_paren)) return p.failHere();
+    list.items[count_at] = @intCast(list.items.len - count_at - 1);
+}
+
+fn addBinary(p: *Parse, tag: Node.Tag, op: TokenIndex, lhs: Node.Index, rhs: u32) Allocator.Error!Node.Index {
+    return p.addNode(.{
+        .tag = tag,
+        .main_token = op,
+        .data = .{ .lhs = @backingInt(lhs), .rhs = rhs },
+    });
 }
 
 /// A term, a name, a parenthesized expression or row value, or a prefix operator and its
@@ -268,11 +390,17 @@ fn parseParenthesized(p: *Parse) Error!Node.Index {
     return p.addNode(.{ .tag = .row_value, .main_token = open, .data = try p.addExtraRange(items.items) });
 }
 
-/// Appends `items` to `extra_data` and returns the range they occupy.
-fn addExtraRange(p: *Parse, items: []const u32) Allocator.Error!Node.Data {
+/// Appends `items` to `extra_data` and returns the index of the first.
+fn addExtra(p: *Parse, items: []const u32) Allocator.Error!u32 {
     const start: u32 = @intCast(p.extra_data.items.len);
     try p.extra_data.appendSlice(p.gpa, items);
-    return .{ .lhs = start, .rhs = @intCast(p.extra_data.items.len) };
+    return start;
+}
+
+/// Appends `items` to `extra_data` and returns the range they occupy.
+fn addExtraRange(p: *Parse, items: []const u32) Allocator.Error!Node.Data {
+    const start = try p.addExtra(items);
+    return .{ .lhs = start, .rhs = start + @as(u32, @intCast(items.len)) };
 }
 
 /// Called on entry to every rule that can recurse; fails once nesting passes `max_depth`.

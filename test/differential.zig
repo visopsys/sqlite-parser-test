@@ -347,6 +347,76 @@ test "the parser agrees with SQLite on the corpus" {
     try std.testing.expect(report.checked > 1000);
 }
 
+/// SQLite's verdict on the whole `sql` script, from walking it statement by statement:
+/// accepted when every statement is, else the first rejected statement with its offset
+/// shifted to the script. Unknown when any statement is.
+fn scriptOutcome(sql: []const u8) !oracle.Result {
+    var outcome: ?oracle.Result = null;
+    var unknown = false;
+    var pos: usize = 0;
+    while (pos < sql.len) {
+        var result = try oracle.check(sql[pos..]);
+        if (result.verdict == .unknown) unknown = true;
+        if (result.verdict == .reject and outcome == null) {
+            if (result.error_offset) |offset| result.error_offset = @intCast(pos + offset);
+            outcome = result;
+        }
+        pos += result.length;
+    }
+    var script = outcome orelse std.mem.zeroInit(oracle.Result, .{ .verdict = .accept });
+    if (unknown) script.verdict = .unknown;
+    script.length = @intCast(sql.len);
+    return script;
+}
+
+/// Parses each corpus script in one call and compares it with SQLite's walk of it.
+/// Scripts with a statement in known_divergences.txt are skipped.
+fn checkScripts(gpa: std.mem.Allocator, report: *Report) !void {
+    var scratch_state: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const divergences = try loadDivergences(report.arena.allocator(), @embedFile("known_divergences.txt"));
+
+    var it: corpus.Iterator = .init(corpus.sqlite_tests);
+    while (it.next()) |case| {
+        _ = scratch_state.reset(.retain_capacity);
+        if (hasDivergence(divergences, case.id)) continue;
+        const result = try scriptOutcome(case.sql);
+        if (result.verdict == .unknown) {
+            report.skipped_unknown += 1;
+            continue;
+        }
+        report.checked += 1;
+        const ours = try judge(scratch, case.sql);
+        if (compare(result, ours)) |mismatch| {
+            try report.addFailure(failureOf(.{ .case_id = case.id, .index = 0 }, case.sql, mismatch, result, ours));
+        }
+    }
+}
+
+fn hasDivergence(divergences: std.StringHashMapUnmanaged(DivergenceState), case_id: []const u8) bool {
+    var keys = divergences.keyIterator();
+    while (keys.next()) |key| {
+        if (key.len > case_id.len and std.mem.startsWith(u8, key.*, case_id) and key.*[case_id.len] == '#') return true;
+    }
+    return false;
+}
+
+test "the parser agrees with SQLite on whole corpus scripts" {
+    var report: Report = .init(std.testing.allocator);
+    defer report.deinit();
+    try checkScripts(std.testing.allocator, &report);
+    try report.finish();
+    try std.testing.expect(report.checked > 1000);
+}
+
+test "a script's outcome is its first rejected statement, shifted" {
+    const result = try scriptOutcome("SELECT 1; BEGIN FOO; BEGIN BAR");
+    try std.testing.expectEqual(oracle.Verdict.reject, result.verdict);
+    try std.testing.expectEqualStrings("near \"FOO\": syntax error", result.messageText());
+    try std.testing.expectEqual(@as(?u32, 16), result.error_offset);
+}
+
 const operators = [_][]const u8{
     "+",  "-",  "*", "/", "%",  "=", "==", "!=", "<>", "<", "<=", ">", ">=",
     "<<", ">>", "&", "|", "||", "~", ",",  ".",  "(",  ")", ";",

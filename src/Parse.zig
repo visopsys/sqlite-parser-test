@@ -76,6 +76,7 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     defer p.leave();
     const first = p.peek();
     switch (first) {
+        .keyword_select => return p.parseSelect(),
         // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
         // recognized so far; every statement CREATE can start is still rejected there.
         .keyword_create => {
@@ -106,6 +107,172 @@ fn parseStatement(p: *Parse) Error!Node.Index {
         else => unreachable,
     };
     return p.addNode(.{ .tag = tag, .main_token = main_token, .data = data });
+}
+
+/// `select ::= SELECT distinct selcollist`; nothing may follow the result columns yet.
+fn parseSelect(p: *Parse) Error!Node.Index {
+    const select = p.nextToken();
+    const distinct = p.eat(.keyword_distinct);
+    if (!distinct) _ = p.eat(.keyword_all);
+    var columns: std.ArrayList(u32) = .empty;
+    defer columns.deinit(p.gpa);
+    while (true) {
+        try columns.append(p.gpa, @backingInt(try p.parseResultColumn()));
+        if (!p.eat(.comma)) break;
+    }
+    return p.addNode(.{
+        .tag = if (distinct) .select_distinct else .select,
+        .main_token = select,
+        .data = try p.addExtraRange(columns.items),
+    });
+}
+
+/// `selcollist ::= expr as | STAR`, where `as ::= AS nm | ids | `.
+fn parseResultColumn(p: *Parse) Error!Node.Index {
+    const first = p.tok_i;
+    if (p.eat(.star)) return p.addNode(.{
+        .tag = .result_star,
+        .main_token = @fromBackingInt(first),
+        .data = .{ .lhs = 0, .rhs = 0 },
+    });
+    const expr = try p.parseExpr(0);
+    const alias: u32 = if (p.eat(.keyword_as))
+        try p.parseName(.nm)
+    else if (p.acceptName(.ids)) |name|
+        @backingInt(name)
+    else
+        0;
+    return p.addNode(.{
+        .tag = .result_expr,
+        .main_token = @fromBackingInt(first),
+        .data = .{ .lhs = @backingInt(expr), .rhs = alias },
+    });
+}
+
+/// The precedence levels of the `%left`, `%right` and `%nonassoc` block of parse.y,
+/// loosest first. Every infix operator is left associative, as in parse.y except for
+/// ESCAPE, which a later rule handles.
+const Level = enum(u8) {
+    logical_or = 1,
+    logical_and,
+    not,
+    equality,
+    comparison,
+    escape,
+    bitwise,
+    additive,
+    multiplicative,
+    concat,
+    collate,
+    bitnot,
+
+    /// The binding power with which the operator takes the expression on its left.
+    fn left(level: Level) u8 {
+        return 2 * @backingInt(level);
+    }
+
+    /// The least binding power an operator needs to join the operand on its right.
+    fn right(level: Level) u8 {
+        return left(level) + 1;
+    }
+};
+
+fn infixLevel(tag: Token.Tag) ?Level {
+    return switch (tag) {
+        .keyword_or => .logical_or,
+        .keyword_and => .logical_and,
+        .keyword_is, .equal, .equal_equal, .not_equal => .equality,
+        .l_angle_bracket, .angle_bracket_left_equal, .r_angle_bracket, .angle_bracket_right_equal => .comparison,
+        .ampersand, .pipe, .angle_bracket_left_angle_bracket_left, .angle_bracket_right_angle_bracket_right => .bitwise,
+        .plus, .minus => .additive,
+        .star, .slash, .percent => .multiplicative,
+        .pipe_pipe, .arrow, .arrow2 => .concat,
+        else => null,
+    };
+}
+
+/// Parses an expression whose infix operators all bind at least as tightly as `min_bp`.
+/// A chain of operators of one level loops here instead of recursing.
+fn parseExpr(p: *Parse, min_bp: u8) Error!Node.Index {
+    try p.enter();
+    defer p.leave();
+    var lhs = try p.parsePrimary();
+    while (infixLevel(p.peek())) |level| {
+        if (level.left() < min_bp) break;
+        const is_op = p.peek() == .keyword_is;
+        const op = p.nextToken();
+        const tag: Node.Tag = if (is_op and p.eat(.keyword_not)) .is_not else .binary;
+        const rhs = try p.parseExpr(level.right());
+        lhs = try p.addNode(.{
+            .tag = tag,
+            .main_token = op,
+            .data = .{ .lhs = @backingInt(lhs), .rhs = @backingInt(rhs) },
+        });
+    }
+    return lhs;
+}
+
+/// A term, a name, a parenthesized expression or row value, or a prefix operator and its
+/// operand.
+fn parsePrimary(p: *Parse) Error!Node.Index {
+    const first = p.peek();
+    const main_token: TokenIndex = @fromBackingInt(p.tok_i);
+    switch (first) {
+        .integer_literal, .float_literal, .blob_literal, .keyword_null, .keyword_ctime_kw => {
+            _ = p.nextToken();
+            return p.addNode(.{ .tag = .literal, .main_token = main_token, .data = .{ .lhs = 0, .rhs = 0 } });
+        },
+        .string_literal => if (p.token_tags[p.tok_i + 1] != .dot) {
+            _ = p.nextToken();
+            return p.addNode(.{ .tag = .literal, .main_token = main_token, .data = .{ .lhs = 0, .rhs = 0 } });
+        },
+        .variable => {
+            _ = p.nextToken();
+            return p.addNode(.{ .tag = .variable, .main_token = main_token, .data = .{ .lhs = 0, .rhs = 0 } });
+        },
+        .minus, .plus, .tilde, .keyword_not => {
+            _ = p.nextToken();
+            const level: Level = if (first == .keyword_not) .not else .bitnot;
+            const operand = try p.parseExpr(level.right());
+            return p.addNode(.{
+                .tag = .unary,
+                .main_token = main_token,
+                .data = .{ .lhs = @backingInt(operand), .rhs = 0 },
+            });
+        },
+        .l_paren => return p.parseParenthesized(),
+        else => {},
+    }
+    // CAST and RAISE open expressions of their own, so they are not names here.
+    if (first == .keyword_cast or first == .keyword_raise) return p.failHere();
+    if (!name_tags.get(.nm).contains(first)) return p.failHere();
+    _ = p.nextToken();
+    var parts: u32 = 1;
+    while (parts < 3 and p.eat(.dot)) : (parts += 1) _ = try p.parseName(.nm);
+    return p.addNode(.{ .tag = .name, .main_token = main_token, .data = .{ .lhs = parts, .rhs = 0 } });
+}
+
+/// `LP expr RP` or `LP nexprlist COMMA expr RP`.
+fn parseParenthesized(p: *Parse) Error!Node.Index {
+    const open = p.nextToken();
+    const first = try p.parseExpr(0);
+    if (p.peek() != .comma) {
+        if (!p.eat(.r_paren)) return p.failHere();
+        return p.addNode(.{ .tag = .paren, .main_token = open, .data = .{ .lhs = @backingInt(first), .rhs = 0 } });
+    }
+    var items: std.ArrayList(u32) = .empty;
+    defer items.deinit(p.gpa);
+    try items.append(p.gpa, @backingInt(first));
+    while (p.eat(.comma)) try items.append(p.gpa, @backingInt(try p.parseExpr(0)));
+    if (!p.eat(.r_paren)) return p.failHere();
+    return p.addNode(.{ .tag = .row_value, .main_token = open, .data = try p.addExtraRange(items.items) });
+}
+
+/// Appends `items` to `extra_data` and returns the range they occupy.
+fn addExtraRange(p: *Parse, items: []const u32) Allocator.Error!Node.Data {
+    const start: u32 = @intCast(p.extra_data.items.len);
+    try p.extra_data.appendSlice(p.gpa, items);
+    return .{ .lhs = start, .rhs = @intCast(p.extra_data.items.len) };
 }
 
 /// Called on entry to every rule that can recurse; fails once nesting passes `max_depth`.

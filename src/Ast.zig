@@ -71,6 +71,35 @@ pub const Node = struct {
         savepoint,
         /// `RELEASE [SAVEPOINT] name`. `lhs` is the name token.
         release,
+        /// `SELECT [ALL] columns`. `lhs..rhs` is the range of `extra_data` holding the
+        /// `result_star` and `result_expr` nodes. `main_token` is `SELECT`.
+        select,
+        /// `SELECT DISTINCT columns`, laid out like `select`.
+        select_distinct,
+        /// `*` as a result column. `main_token` is the star.
+        result_star,
+        /// `expr [[AS] alias]` as a result column. `lhs` is the expression and `rhs` the
+        /// alias token or 0 when there is none (the first token is never an alias).
+        result_expr,
+        /// A number, string, blob, `NULL` or `CURRENT_*` term. `main_token` is the token.
+        literal,
+        /// A bound parameter such as `?1` or `:a`. `main_token` is the token.
+        variable,
+        /// `a`, `a.b` or `a.b.c`. `main_token` is the first name and `lhs` the number of
+        /// names; they are every other token, from `main_token` on.
+        name,
+        /// `(lhs)`. `main_token` is the left parenthesis.
+        paren,
+        /// `(a, b, ...)`. `lhs..rhs` is the range of `extra_data` holding the expression
+        /// nodes. `main_token` is the left parenthesis.
+        row_value,
+        /// A prefix operator, one of `- + ~ NOT`, applied to `lhs`. `main_token` is the operator.
+        unary,
+        /// `lhs OP rhs` for the infix operators that take two plain operands.
+        /// `main_token` is the operator.
+        binary,
+        /// `lhs IS NOT rhs`. `main_token` is `IS`.
+        is_not,
     };
 };
 
@@ -216,13 +245,88 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try writer.writeAll(if (n.tag == .savepoint) "SAVEPOINT " else "RELEASE ");
             try self.renderName(n.data.lhs, writer);
         },
+        .select, .select_distinct => {
+            try writer.writeAll(if (n.tag == .select) "SELECT " else "SELECT DISTINCT ");
+            for (self.extra_data[n.data.lhs..n.data.rhs], 0..) |column, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try self.renderResultColumn(@fromBackingInt(@intCast(column)), writer);
+            }
+        },
+        .result_star,
+        .result_expr,
+        .literal,
+        .variable,
+        .name,
+        .paren,
+        .row_value,
+        .unary,
+        .binary,
+        .is_not,
+        => unreachable,
     }
 }
 
+fn renderResultColumn(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = self.nodes.get(@backingInt(node));
+    if (n.tag == .result_star) return writer.writeByte('*');
+    try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+    if (n.data.rhs == 0) return;
+    try writer.writeAll(" AS ");
+    try self.renderName(n.data.rhs, writer);
+}
+
+/// Writes an expression with every operator application in parentheses, so that the
+/// text means the same to SQLite whatever precedence it assigns.
+fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = self.nodes.get(@backingInt(node));
+    const main_token: u32 = @backingInt(n.main_token);
+    switch (n.tag) {
+        .literal => switch (self.tokens.items(.tag)[main_token]) {
+            .keyword_null, .keyword_ctime_kw => try writeUpper(self.tokenText(n.main_token), writer),
+            else => try writer.writeAll(self.tokenText(n.main_token)),
+        },
+        .variable => try writer.writeAll(self.tokenText(n.main_token)),
+        .name => for (0..n.data.lhs) |i| {
+            if (i > 0) try writer.writeByte('.');
+            try self.renderName(main_token + 2 * @as(u32, @intCast(i)), writer);
+        },
+        .paren => try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer),
+        .row_value => {
+            try writer.writeByte('(');
+            for (self.extra_data[n.data.lhs..n.data.rhs], 0..) |item, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try self.renderExpr(@fromBackingInt(@intCast(item)), writer);
+            }
+            try writer.writeByte(')');
+        },
+        .unary => {
+            try writer.writeByte('(');
+            try writeUpper(self.tokens.items(.tag)[main_token].symbol(), writer);
+            if (self.tokens.items(.tag)[main_token] == .keyword_not) try writer.writeByte(' ');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeByte(')');
+        },
+        .binary, .is_not => {
+            try writer.writeByte('(');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+            try writer.writeByte(' ');
+            try writeUpper(self.tokens.items(.tag)[main_token].symbol(), writer);
+            if (n.tag == .is_not) try writer.writeAll(" NOT");
+            try writer.writeByte(' ');
+            try self.renderExpr(@fromBackingInt(@intCast(n.data.rhs)), writer);
+            try writer.writeByte(')');
+        },
+        else => unreachable,
+    }
+}
+
+fn writeUpper(text: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (text) |c| try writer.writeByte(std.ascii.toUpper(c));
+}
+
 fn renderKeyword(self: Ast, token: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    const lexeme = self.tokens.items(.tag)[token].lexeme().?;
     try writer.writeByte(' ');
-    for (lexeme) |c| try writer.writeByte(std.ascii.toUpper(c));
+    try writeUpper(self.tokens.items(.tag)[token].lexeme().?, writer);
 }
 
 fn renderTransactionName(self: Ast, name: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -296,7 +400,6 @@ test "inputs without statements are valid" {
 
 test "syntax error blames the first token" {
     try expectError("FOO", "near \"FOO\": syntax error", .{ .byte_offset = 0, .line = 1, .column = 1 });
-    try expectError("SELECT", "near \"SELECT\": syntax error", .{ .byte_offset = 0, .line = 1, .column = 1 });
 }
 
 test "syntax error after leading empty statements" {
@@ -476,4 +579,125 @@ test "an error on a later line" {
 test "an invalid token inside a transaction statement" {
     try expectError("BEGIN \x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 6, .line = 1, .column = 7 });
     try expectError("SAVEPOINT 'abc", "unrecognized token: \"'abc\"", .{ .byte_offset = 10, .line = 1, .column = 11 });
+}
+
+test "result columns" {
+    try expectRender("select 1", "SELECT 1;\n");
+    try expectRender("SELECT ALL 1", "SELECT 1;\n");
+    try expectRender("SELECT DISTINCT 1, 2", "SELECT DISTINCT 1, 2;\n");
+    try expectRender("SELECT *", "SELECT *;\n");
+    try expectRender("SELECT 1 x, 2 AS y, 3 AS 'z z', 4 \"w\", 5 desc, 6 AS left", "SELECT 1 AS x, 2 AS y, 3 AS \"z z\", 4 AS w, 5 AS \"desc\", 6 AS \"left\";\n");
+    try expectRender("SELECT *, a, *", "SELECT *, a, *;\n");
+    try expectRender("explain select 1; select 2", "EXPLAIN SELECT 1;\nSELECT 2;\n");
+}
+
+test "primary expressions" {
+    try expectRender(
+        "SELECT 1, 0x1F, 1.5e3, .5, 'it''s', x'ab', null, true, current_date, Current_Time, current_timestamp",
+        "SELECT 1, 0x1F, 1.5e3, .5, 'it''s', x'ab', NULL, true, CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP;\n",
+    );
+    try expectRender("SELECT ?, ?1, :a, @b, $c", "SELECT ?, ?1, :a, @b, $c;\n");
+    try expectRender(
+        "SELECT a, a.b, a.b.c, \"x y\".z, 'q'.r, [s].[t].`u`, abort, left, indexed, replace",
+        "SELECT a, a.b, a.b.c, \"x y\".z, q.r, s.t.u, \"abort\", \"left\", \"indexed\", \"replace\";\n",
+    );
+    try expectRender("SELECT t.desc, t.left", "SELECT t.\"desc\", t.\"left\";\n");
+    try expectRender("SELECT (1), ((a)), (1, 2, 3), ((1, 2), 3)", "SELECT 1, a, (1, 2, 3), ((1, 2), 3);\n");
+}
+
+test "unary operators" {
+    try expectRender("SELECT -1, +a, ~b, NOT c", "SELECT (-1), (+a), (~b), (NOT c);\n");
+    try expectRender("SELECT - - 1, NOT NOT a, -~+a", "SELECT (-(-1)), (NOT (NOT a)), (-(~(+a)));\n");
+}
+
+test "binary operators" {
+    try expectRender(
+        "SELECT a OR b, a AND b, a = b, a == b, a != b, a <> b, a < b, a <= b, a > b, a >= b",
+        "SELECT (a OR b), (a AND b), (a = b), (a == b), (a != b), (a != b), (a < b), (a <= b), (a > b), (a >= b);\n",
+    );
+    try expectRender(
+        "SELECT a & b, a | b, a << b, a >> b, a + b, a - b, a * b, a / b, a % b, a || b, a -> b, a ->> b, a IS b, a IS NOT b",
+        "SELECT (a & b), (a | b), (a << b), (a >> b), (a + b), (a - b), (a * b), (a / b), (a % b), (a || b), (a -> b), (a ->> b), (a IS b), (a IS NOT b);\n",
+    );
+}
+
+test "precedence between adjacent levels" {
+    try expectRender("SELECT a OR b AND c", "SELECT (a OR (b AND c));\n");
+    try expectRender("SELECT a AND b OR c", "SELECT ((a AND b) OR c);\n");
+    try expectRender("SELECT a AND NOT b", "SELECT (a AND (NOT b));\n");
+    try expectRender("SELECT NOT a AND b", "SELECT ((NOT a) AND b);\n");
+    try expectRender("SELECT NOT a = b", "SELECT (NOT (a = b));\n");
+    try expectRender("SELECT a = NOT b", "SELECT (a = (NOT b));\n");
+    try expectRender("SELECT a = b < c", "SELECT (a = (b < c));\n");
+    try expectRender("SELECT a < b = c", "SELECT ((a < b) = c);\n");
+    try expectRender("SELECT a IS b < c", "SELECT (a IS (b < c));\n");
+    try expectRender("SELECT a < b | c", "SELECT (a < (b | c));\n");
+    try expectRender("SELECT a | b < c", "SELECT ((a | b) < c);\n");
+    try expectRender("SELECT a | b + c", "SELECT (a | (b + c));\n");
+    try expectRender("SELECT a + b | c", "SELECT ((a + b) | c);\n");
+    try expectRender("SELECT a + b * c", "SELECT (a + (b * c));\n");
+    try expectRender("SELECT a * b + c", "SELECT ((a * b) + c);\n");
+    try expectRender("SELECT a * b || c", "SELECT (a * (b || c));\n");
+    try expectRender("SELECT a || b * c", "SELECT ((a || b) * c);\n");
+    try expectRender("SELECT a -> b * c", "SELECT ((a -> b) * c);\n");
+    try expectRender("SELECT -a || b", "SELECT ((-a) || b);\n");
+    try expectRender("SELECT a || -b", "SELECT (a || (-b));\n");
+    try expectRender("SELECT ~a + b", "SELECT ((~a) + b);\n");
+    try expectRender("SELECT a + ~b", "SELECT (a + (~b));\n");
+    try expectRender("SELECT 1 + 2 * 3", "SELECT (1 + (2 * 3));\n");
+}
+
+test "operators of one level associate to the left" {
+    try expectRender("SELECT a - b - c", "SELECT ((a - b) - c);\n");
+    try expectRender("SELECT a = b == c <> d", "SELECT (((a = b) == c) != d);\n");
+    try expectRender("SELECT a -> b ->> c || d", "SELECT (((a -> b) ->> c) || d);\n");
+    try expectRender("SELECT a IS NOT b IS c", "SELECT ((a IS NOT b) IS c);\n");
+    try expectRender("SELECT a IS NOT NOT b", "SELECT (a IS NOT (NOT b));\n");
+    try expectRender("SELECT (a OR b) AND c", "SELECT ((a OR b) AND c);\n");
+}
+
+test "a long chain of operators does not recurse per operator" {
+    const gpa = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "SELECT 1");
+    for (0..10_000) |_| try source.appendSlice(gpa, "+1");
+    try source.append(gpa, 0);
+    var ast = try parse(gpa, source.items[0 .. source.items.len - 1 :0]);
+    defer ast.deinit(gpa);
+    try std.testing.expectEqual(0, ast.errors.len);
+}
+
+test "deep nesting is an error, not a stack overflow" {
+    const gpa = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "SELECT ");
+    for (0..100_000) |_| try source.appendSlice(gpa, "(");
+    try source.append(gpa, 0);
+    try expectError(source.items[0 .. source.items.len - 1 :0], "Expression tree is too large (maximum depth 1000)", .{ .byte_offset = 1006, .line = 1, .column = 1007 });
+
+    source.clearRetainingCapacity();
+    try source.appendSlice(gpa, "SELECT ");
+    for (0..100_000) |_| try source.appendSlice(gpa, "- ");
+    try source.append(gpa, 0);
+    try expectError(source.items[0 .. source.items.len - 1 :0], "Expression tree is too large (maximum depth 1000)", .{ .byte_offset = 2005, .line = 1, .column = 2006 });
+}
+
+test "expression syntax errors" {
+    try expectError("SELECT", "incomplete input", .{ .byte_offset = 6, .line = 1, .column = 7 });
+    try expectError("SELECT 1 +", "incomplete input", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("SELECT 1 +\n  *", "near \"*\": syntax error", .{ .byte_offset = 13, .line = 2, .column = 3 });
+    try expectError("SELECT 1 2", "near \"2\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SELECT (1", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SELECT (1 2)", "near \"2\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
+    try expectError("SELECT ()", "near \")\": syntax error", .{ .byte_offset = 8, .line = 1, .column = 9 });
+    try expectError("SELECT 1 FROM", "near \"FROM\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SELECT a.", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SELECT a.b.c.d", "near \".\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("SELECT 1,", "incomplete input", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SELECT 1 AS", "incomplete input", .{ .byte_offset = 11, .line = 1, .column = 12 });
+    try expectError("SELECT * x", "near \"x\": syntax error", .{ .byte_offset = 9, .line = 1, .column = 10 });
+    try expectError("SELECT select", "near \"select\": syntax error", .{ .byte_offset = 7, .line = 1, .column = 8 });
+    try expectError("SELECT 1 + \x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 11, .line = 1, .column = 12 });
 }

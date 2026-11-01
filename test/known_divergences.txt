@@ -1,0 +1,10 @@
+# Statements where our parser and SQLite 3.45.1 are allowed to disagree.
+#
+# One entry per line, tab-separated:
+#   <case id>#<statement index>	<reason>
+# The case id is the corpus header (`<test file>:<line>`); the statement index counts
+# from 0 within the script. The reason says why SQLite's verdict depends on something
+# other than the text (see docs/research.md, section 3). Never list our own bug here.
+#
+# The differential test fails on a disagreement that is not listed, and on a listed
+# entry that no longer disagrees.

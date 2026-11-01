@@ -36,7 +36,7 @@ pub const Family = enum {
 };
 
 /// The families whose statements the differential tests check.
-const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced };
+const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced, .insert };
 
 fn isImplemented(family: Family) bool {
     return std.mem.indexOfScalar(Family, &implemented, family) != null;

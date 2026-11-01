@@ -1544,3 +1544,93 @@ test "SELECT errors" {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
     }
 }
+
+test "WITH clauses" {
+    const cases = [_][2][:0]const u8{
+        .{ "WITH x AS (SELECT 1) SELECT * FROM x", "WITH x AS (SELECT 1) SELECT * FROM x;\n" },
+        .{
+            "WITH RECURSIVE x(a, b) AS MATERIALIZED (SELECT 1, 2), y AS NOT MATERIALIZED (VALUES (1)) SELECT * FROM x, y",
+            "WITH RECURSIVE x(a, b) AS MATERIALIZED (SELECT 1, 2), y AS NOT MATERIALIZED (VALUES (1)) SELECT * FROM x, y;\n",
+        },
+        .{ "WITH x AS (SELECT 1) VALUES (2)", "WITH x AS (SELECT 1) VALUES (2);\n" },
+        .{ "with x(a) as (select 1 union select 2) select a from x", "WITH x(a) AS (SELECT 1 UNION SELECT 2) SELECT a FROM x;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "window functions" {
+    const cases = [_][2][:0]const u8{
+        .{ "SELECT sum(a) OVER () FROM t", "SELECT sum(a) OVER () FROM t;\n" },
+        .{ "SELECT sum(a) OVER w FROM t", "SELECT sum(a) OVER w FROM t;\n" },
+        .{
+            "SELECT sum(a) OVER (w PARTITION BY a, b ORDER BY c DESC NULLS LAST) FROM t",
+            "SELECT sum(a) OVER (w PARTITION BY a, b ORDER BY c DESC NULLS LAST) FROM t;\n",
+        },
+        .{ "SELECT f(a) FILTER (WHERE a > 1) OVER w FROM t", "SELECT f(a) FILTER (WHERE (a > 1)) OVER w FROM t;\n" },
+        .{ "SELECT count(*) FILTER (WHERE x) FROM t", "SELECT count(*) FILTER (WHERE x) FROM t;\n" },
+        .{
+            "SELECT a FROM t WINDOW w AS (PARTITION BY a), v AS (w ORDER BY a)",
+            "SELECT a FROM t WINDOW w AS (PARTITION BY a), v AS (w ORDER BY a);\n",
+        },
+        .{ "SELECT 1 FROM t WINDOW w AS ()", "SELECT 1 FROM t WINDOW w AS ();\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "window frames" {
+    const cases = [_][2][:0]const u8{
+        .{ "SELECT f(a) OVER (RANGE UNBOUNDED PRECEDING)", "SELECT f(a) OVER (RANGE UNBOUNDED PRECEDING);\n" },
+        .{ "SELECT f(a) OVER (ROWS CURRENT ROW)", "SELECT f(a) OVER (ROWS CURRENT ROW);\n" },
+        .{ "SELECT f(a) OVER (GROUPS 2 FOLLOWING)", "SELECT f(a) OVER (GROUPS 2 FOLLOWING);\n" },
+        .{ "SELECT f(a) OVER (ROWS 3 PRECEDING)", "SELECT f(a) OVER (ROWS 3 PRECEDING);\n" },
+        .{
+            "SELECT f(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING)",
+            "SELECT f(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING);\n",
+        },
+        .{
+            "SELECT f(a) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",
+            "SELECT f(a) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);\n",
+        },
+        .{
+            "SELECT f(a) OVER (GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)",
+            "SELECT f(a) OVER (GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING);\n",
+        },
+        .{ "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE NO OTHERS)", "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE NO OTHERS);\n" },
+        .{ "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE CURRENT ROW)", "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE CURRENT ROW);\n" },
+        .{ "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE GROUP)", "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE GROUP);\n" },
+        .{ "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE TIES)", "SELECT f(a) OVER (ROWS CURRENT ROW EXCLUDE TIES);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "WINDOW, OVER and FILTER as identifiers in expressions and aliases" {
+    const cases = [_][2][:0]const u8{
+        .{ "SELECT over FROM t", "SELECT \"over\" FROM t;\n" },
+        .{ "SELECT filter FROM t", "SELECT \"filter\" FROM t;\n" },
+        .{ "SELECT window FROM t", "SELECT \"window\" FROM t;\n" },
+        .{ "SELECT filter(x) FROM t", "SELECT \"filter\"(x) FROM t;\n" },
+        .{ "SELECT 1 AS window", "SELECT 1 AS \"window\";\n" },
+        .{ "SELECT f(x) over FROM t", "SELECT f(x) AS \"over\" FROM t;\n" },
+        .{ "SELECT f(x) filter FROM t", "SELECT f(x) AS \"filter\" FROM t;\n" },
+        .{ "SELECT 1 FROM t window", "SELECT 1 FROM t AS \"window\";\n" },
+        .{ "SELECT 1 FROM t over", "SELECT 1 FROM t AS \"over\";\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "WITH and window syntax errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "WITH x(a COLLATE nocase) AS (SELECT 1) SELECT 1", "syntax error after column name \"a\"", 23 },
+        .{ "WITH x(a ASC) AS (SELECT 1) SELECT 1", "syntax error after column name \"a\"", 12 },
+        .{ "WITH x(a DESC) AS (SELECT 1) SELECT 1", "syntax error after column name \"a\"", 13 },
+        .{ "WITH x AS SELECT 1", "near \"SELECT\": syntax error", 10 },
+        .{ "WITH x AS (SELECT 1)", "incomplete input", 20 },
+        .{ "SELECT sum(a) OVER (ROWS) FROM t", "near \")\": syntax error", 24 },
+        .{ "SELECT 1 FROM t WINDOW w AS () x", "near \"x\": syntax error", 31 },
+        .{ "SELECT sum(a) OVER (", "incomplete input", 20 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+}

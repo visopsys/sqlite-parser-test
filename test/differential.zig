@@ -1,6 +1,6 @@
 //! Compares our parser with SQLite's on the corpus and on mutants of it. This file
-//! holds the pieces that decide whether the two agree: the statement families, which
-//! say what is checked yet, and `compare`, which says what agreeing means.
+//! holds the pieces that decide whether the two agree, chiefly `compare`, which says
+//! what agreeing means.
 
 const std = @import("std");
 const sqlite_parser = @import("sqlite_parser");
@@ -8,147 +8,7 @@ const corpus = @import("corpus.zig");
 const oracle = @import("oracle.zig");
 
 const Ast = sqlite_parser.Ast;
-const Tag = sqlite_parser.tokenizer.Token.Tag;
 const Tokenizer = sqlite_parser.tokenizer.Tokenizer;
-
-/// The kind of a statement, by its leading keywords. Families are enabled for
-/// checking one at a time, as the parser learns them.
-pub const Family = enum {
-    empty,
-    transaction,
-    pragma,
-    attach,
-    maintenance,
-    select_expressions,
-    select,
-    select_advanced,
-    insert,
-    update,
-    delete,
-    create_table,
-    alter_table,
-    create_index,
-    create_view,
-    create_virtual_table,
-    drop,
-    create_trigger,
-    other,
-};
-
-/// The families whose statements the differential tests check.
-const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced, .insert, .update, .delete, .create_table, .alter_table, .create_index, .create_view, .create_trigger, .create_virtual_table, .drop };
-
-fn isImplemented(family: Family) bool {
-    return std.mem.indexOfScalar(Family, &implemented, family) != null;
-}
-
-/// Classifies one statement by its first token after an optional `EXPLAIN [QUERY PLAN]`.
-pub fn familyOf(statement: [:0]const u8) Family {
-    var t: Tokenizer = .init(statement);
-    var first = t.next();
-    if (first.tag == .keyword_explain) {
-        first = t.next();
-        if (first.tag == .keyword_query) {
-            const plan = t.next();
-            if (plan.tag != .keyword_plan) return .other;
-            first = t.next();
-        }
-    }
-    return switch (first.tag) {
-        .eof, .semicolon => .empty,
-        .keyword_begin,
-        .keyword_commit,
-        .keyword_end,
-        .keyword_rollback,
-        .keyword_savepoint,
-        .keyword_release,
-        => .transaction,
-        .keyword_pragma => utilityFamily(&t, .pragma),
-        .keyword_attach, .keyword_detach => utilityFamily(&t, .attach),
-        .keyword_vacuum, .keyword_reindex, .keyword_analyze => utilityFamily(&t, .maintenance),
-        .keyword_select, .keyword_values => selectFamily(&t, first.tag),
-        .keyword_with => withFamily(&t),
-        .keyword_insert, .keyword_replace => .insert,
-        .keyword_update => .update,
-        .keyword_delete => .delete,
-        .keyword_create => createFamily(&t),
-        .keyword_alter => .alter_table,
-        .keyword_drop => .drop,
-        else => .other,
-    };
-}
-
-/// A utility statement whose expression holds a subquery depends on the SELECT grammar, so
-/// it is checked with the `select` family rather than its own.
-fn utilityFamily(t: *Tokenizer, family: Family) Family {
-    while (true) {
-        switch (t.next().tag) {
-            .eof => return family,
-            .keyword_select, .keyword_values, .keyword_exists => return .select,
-            else => {},
-        }
-    }
-}
-
-fn selectFamily(t: *Tokenizer, first: Tag) Family {
-    var expressions = first == .keyword_select;
-    var advanced = false;
-    while (true) {
-        switch (t.next().tag) {
-            .eof => break,
-            .keyword_with, .keyword_over, .keyword_filter, .keyword_window => advanced = true,
-            .keyword_from,
-            .keyword_where,
-            .keyword_group,
-            .keyword_having,
-            .keyword_order,
-            .keyword_limit,
-            .keyword_union,
-            .keyword_intersect,
-            .keyword_except,
-            .keyword_values,
-            .keyword_select,
-            .keyword_exists,
-            .keyword_in,
-            => expressions = false,
-            else => {},
-        }
-        if (advanced) return .select_advanced;
-    }
-    return if (expressions) .select_expressions else .select;
-}
-
-/// A WITH-led statement without a top-level SELECT, VALUES or DML keyword is a broken
-/// one of the WITH families, not an `other`: SQLite's verdict depends on the CTE grammar.
-fn withFamily(t: *Tokenizer) Family {
-    var depth: usize = 0;
-    while (true) {
-        switch (t.next().tag) {
-            .eof => return .select_advanced,
-            .l_paren => depth += 1,
-            .r_paren => depth -|= 1,
-            .keyword_select, .keyword_values => if (depth == 0) return .select_advanced,
-            .keyword_insert, .keyword_replace => if (depth == 0) return .insert,
-            .keyword_update => if (depth == 0) return .update,
-            .keyword_delete => if (depth == 0) return .delete,
-            else => {},
-        }
-    }
-}
-
-fn createFamily(t: *Tokenizer) Family {
-    var tag = t.next().tag;
-    if (tag == .keyword_temp) tag = t.next().tag;
-    if (tag == .keyword_unique) tag = t.next().tag;
-    return switch (tag) {
-        .keyword_table => .create_table,
-        .keyword_index => .create_index,
-        .keyword_view => .create_view,
-        .keyword_virtual => .create_virtual_table,
-        .keyword_trigger => .create_trigger,
-        else => .other,
-    };
-}
 
 /// What our parser said about a statement.
 const Outcome = struct {
@@ -203,51 +63,6 @@ fn judge(arena: std.mem.Allocator, statement: []const u8) !Outcome {
         .message = message.written(),
         .offset = ast.errorLocation(ast.errors[0]).byte_offset,
     };
-}
-
-fn expectFamily(expected: Family, statement: [:0]const u8) !void {
-    try std.testing.expectEqual(expected, familyOf(statement));
-}
-
-test "familyOf classifies each family" {
-    try expectFamily(.empty, ";");
-    try expectFamily(.empty, "  -- comment\n");
-    try expectFamily(.transaction, "BEGIN");
-    try expectFamily(.transaction, "EXPLAIN QUERY PLAN BEGIN");
-    try expectFamily(.transaction, "explain rollback to s");
-    try expectFamily(.transaction, "SAVEPOINT s");
-    try expectFamily(.pragma, "PRAGMA foreign_keys");
-    try expectFamily(.attach, "ATTACH 'a' AS b");
-    try expectFamily(.attach, "DETACH b");
-    try expectFamily(.maintenance, "VACUUM");
-    try expectFamily(.maintenance, "REINDEX t");
-    try expectFamily(.maintenance, "ANALYZE");
-    try expectFamily(.select_expressions, "SELECT 1+1");
-    try expectFamily(.select_expressions, "SELECT x'abc'");
-    try expectFamily(.select, "SELECT 1 FROM t");
-    try expectFamily(.select, "VALUES (1)");
-    try expectFamily(.select, "SELECT 1 UNION SELECT 2");
-    try expectFamily(.select_advanced, "SELECT count(*) OVER () FROM t");
-    try expectFamily(.select_advanced, "SELECT 1 FROM t WINDOW w AS ()");
-    try expectFamily(.select_advanced, "WITH x AS (SELECT 1) SELECT * FROM x");
-    try expectFamily(.insert, "INSERT INTO t VALUES (1)");
-    try expectFamily(.insert, "REPLACE INTO t VALUES (1)");
-    try expectFamily(.insert, "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x");
-    try expectFamily(.update, "UPDATE t SET a = 1");
-    try expectFamily(.delete, "DELETE FROM t");
-    try expectFamily(.delete, "WITH x AS (SELECT 1) DELETE FROM t");
-    try expectFamily(.select_advanced, "WITH ;");
-    try expectFamily(.create_table, "CREATE TABLE t(a)");
-    try expectFamily(.create_table, "CREATE TEMP TABLE t(a)");
-    try expectFamily(.alter_table, "ALTER TABLE t RENAME TO u");
-    try expectFamily(.create_index, "CREATE UNIQUE INDEX i ON t(a)");
-    try expectFamily(.create_view, "CREATE VIEW v AS SELECT 1");
-    try expectFamily(.create_virtual_table, "CREATE VIRTUAL TABLE t USING m");
-    try expectFamily(.drop, "DROP TABLE t");
-    try expectFamily(.create_trigger, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END");
-    try expectFamily(.other, "@");
-    try expectFamily(.other, "FOO");
-    try expectFamily(.other, "CREATE FOO");
 }
 
 fn check(statement: []const u8) !oracle.Result {
@@ -343,14 +158,15 @@ const Failure = struct {
     }
 };
 
-/// Collects failures and per-family counts over a run, then reports them all at once.
+/// Collects failures and counts over a run, then reports them all at once.
 const Report = struct {
     arena: std.heap.ArenaAllocator,
     failures: std.ArrayList(Failure) = .empty,
     /// Stale or dangling lines of known_divergences.txt.
     stale: std.ArrayList([]const u8) = .empty,
-    checked: std.EnumArray(Family, usize) = .initFill(0),
-    skipped_unknown: std.EnumArray(Family, usize) = .initFill(0),
+    checked: usize = 0,
+    /// Statements whose SQLite verdict is unknown.
+    skipped_unknown: usize = 0,
     /// Mutants that SQLite reads as several statements.
     skipped_split: usize = 0,
 
@@ -362,12 +178,6 @@ const Report = struct {
 
     fn deinit(report: *Report) void {
         report.arena.deinit();
-    }
-
-    fn totalChecked(report: *const Report) usize {
-        var total: usize = 0;
-        for (report.checked.values) |n| total += n;
-        return total;
     }
 
     /// Records a failure, copying the strings that the caller reuses.
@@ -388,7 +198,7 @@ const Report = struct {
         try report.stale.append(arena, try std.fmt.allocPrint(arena, fmt, args));
     }
 
-    /// Prints the first failures, the counts and a per-family summary, and fails if
+    /// Prints the first failures, the counts, and fails if
     /// anything disagreed.
     fn finish(report: *const Report) !void {
         const total = report.failures.items.len + report.stale.items.len;
@@ -398,12 +208,7 @@ const Report = struct {
         }
         for (report.stale.items) |line| std.debug.print("known_divergences.txt: {s}\n", .{line});
         std.debug.print("{d} disagreements (at most {d} listed above)\n", .{ total, max_printed });
-        std.debug.print("checked/unknown per family:", .{});
-        for (std.enums.values(Family)) |family| {
-            std.debug.print(" {t}={d}/{d}", .{
-                family, report.checked.get(family), report.skipped_unknown.get(family),
-            });
-        }
+        std.debug.print("checked={d} unknown={d}", .{ report.checked, report.skipped_unknown });
         std.debug.print(" split mutants={d}\n", .{report.skipped_split});
         return error.TestUnexpectedResult;
     }
@@ -475,7 +280,7 @@ pub fn renderStatement(arena: std.mem.Allocator, statement: []const u8) ![]const
 
 /// Compares one statement with SQLite's `result`, and round-trips it when we accept
 /// it. A `state` marks a statement of known_divergences.txt. Returns whether the
-/// statement was compared, rather than skipped for its family or an unknown verdict.
+/// statement was compared, rather than skipped for an unknown verdict.
 fn checkStatement(
     report: *Report,
     scratch: std.mem.Allocator,
@@ -484,15 +289,13 @@ fn checkStatement(
     result: oracle.Result,
     state: ?*DivergenceState,
 ) !bool {
-    const family = familyOf(try scratch.dupeSentinel(u8, statement, 0));
-    if (!isImplemented(family)) return false;
     const ours = try judge(scratch, statement);
     if (ours.accepted) try checkRoundTrip(report, scratch, origin, statement, result, ours);
     if (result.verdict == .unknown) {
-        report.skipped_unknown.getPtr(family).* += 1;
+        report.skipped_unknown += 1;
         return false;
     }
-    report.checked.getPtr(family).* += 1;
+    report.checked += 1;
     if (compare(result, ours)) |mismatch| {
         if (state) |s| {
             s.* = .disagreed;
@@ -541,7 +344,7 @@ test "the parser agrees with SQLite on the corpus" {
     defer report.deinit();
     try checkCorpus(std.testing.allocator, &report);
     try report.finish();
-    try std.testing.expect(report.totalChecked() > 1000);
+    try std.testing.expect(report.checked > 1000);
 }
 
 const operators = [_][]const u8{
@@ -606,8 +409,8 @@ fn mutate(arena: std.mem.Allocator, random: std.Random, original: []const u8, de
     return std.mem.join(arena, " ", list.items);
 }
 
-/// The corpus statements of implemented families that have at least one token.
-fn implementedStatements(arena: std.mem.Allocator) ![]const []const u8 {
+/// The corpus statements that have at least one token.
+fn corpusStatements(arena: std.mem.Allocator) ![]const []const u8 {
     var statements: std.ArrayList([]const u8) = .empty;
     var it: corpus.Iterator = .init(corpus.sqlite_tests);
     while (it.next()) |case| {
@@ -617,7 +420,6 @@ fn implementedStatements(arena: std.mem.Allocator) ![]const []const u8 {
             const statement = case.sql[pos..][0..length];
             pos += length;
             const source = try arena.dupeSentinel(u8, statement, 0);
-            if (!isImplemented(familyOf(source))) continue;
             if ((try tokenTexts(arena, source)).len == 0) continue;
             try statements.append(arena, statement);
         }
@@ -634,7 +436,7 @@ fn checkMutants(gpa: std.mem.Allocator, report: *Report) !usize {
     var scratch_state: std.heap.ArenaAllocator = .init(gpa);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const statements = try implementedStatements(report.arena.allocator());
+    const statements = try corpusStatements(report.arena.allocator());
 
     var prng: std.Random.DefaultPrng = .init(mutant_seed);
     const random = prng.random();

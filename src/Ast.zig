@@ -318,6 +318,12 @@ test "EXPLAIN followed by a token that starts nothing is a syntax error" {
     try expectError("EXPLAIN QUERY FOO", "near \"FOO\": syntax error", .{ .byte_offset = 14, .line = 1, .column = 15 });
 }
 
+test "CREATE followed by a token that starts nothing blames that token" {
+    try expectError("create bogus", "near \"bogus\": syntax error", .{ .byte_offset = 7, .line = 1, .column = 8 });
+    try expectError("CREATE TEMP FOO", "near \"FOO\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
+    try expectError("CREATE UNIQUE", "incomplete input", .{ .byte_offset = 13, .line = 1, .column = 14 });
+}
+
 test "invalid tokens are unrecognized" {
     try expectError("\x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 0, .line = 1, .column = 1 });
     try expectError(";\x01", "unrecognized token: \"\x01\"", .{ .byte_offset = 1, .line = 1, .column = 2 });

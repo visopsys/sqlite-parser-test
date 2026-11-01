@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const sqlite_parser = @import("sqlite_parser");
+const corpus = @import("corpus.zig");
 const oracle = @import("oracle.zig");
 
 const Ast = sqlite_parser.Ast;
@@ -274,4 +275,185 @@ test "judge summarizes our parse" {
     try std.testing.expect(!bad.accepted);
     try std.testing.expectEqualStrings("near \"FOO\": syntax error", bad.message);
     try std.testing.expectEqual(@as(?usize, 6), bad.offset);
+}
+
+/// One disagreement between SQLite and our parser, with everything needed to read it.
+const Failure = struct {
+    case_id: []const u8,
+    index: usize,
+    statement: []const u8,
+    mismatch: Mismatch,
+    sqlite_verdict: oracle.Verdict,
+    sqlite_message: []const u8,
+    sqlite_offset: ?u32,
+    ours: Outcome,
+    /// For a mutant: the corpus statement it came from and what was changed.
+    original: ?[]const u8 = null,
+    mutation: ?[]const u8 = null,
+
+    pub fn format(failure: Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s}#{d}: {t} differs\n  statement: \"{f}\"\n", .{
+            failure.case_id,
+            failure.index,
+            failure.mismatch,
+            std.zig.fmtString(failure.statement),
+        });
+        if (failure.original) |original| try w.print("  original:  \"{f}\"\n", .{std.zig.fmtString(original)});
+        if (failure.mutation) |mutation| try w.print("  mutation:  {s}\n", .{mutation});
+        try w.print("  sqlite: {t} \"{f}\" offset {?d}\n", .{
+            failure.sqlite_verdict,
+            std.zig.fmtString(failure.sqlite_message),
+            failure.sqlite_offset,
+        });
+        try w.print("  ours:   {s} \"{f}\" offset {?d}\n", .{
+            if (failure.ours.accepted) "accept" else "reject",
+            std.zig.fmtString(failure.ours.message),
+            failure.ours.offset,
+        });
+    }
+};
+
+/// Collects failures and per-family counts over a run, then reports them all at once.
+const Report = struct {
+    arena: std.heap.ArenaAllocator,
+    failures: std.ArrayList(Failure) = .empty,
+    /// Stale or dangling lines of known_divergences.txt.
+    stale: std.ArrayList([]const u8) = .empty,
+    checked: std.EnumArray(Family, usize) = .initFill(0),
+    skipped_unknown: std.EnumArray(Family, usize) = .initFill(0),
+
+    const max_printed = 20;
+
+    fn init(gpa: std.mem.Allocator) Report {
+        return .{ .arena = .init(gpa) };
+    }
+
+    fn deinit(report: *Report) void {
+        report.arena.deinit();
+    }
+
+    fn totalChecked(report: *const Report) usize {
+        var total: usize = 0;
+        for (report.checked.values) |n| total += n;
+        return total;
+    }
+
+    /// Records a failure, copying the strings that the caller reuses.
+    fn addFailure(report: *Report, failure: Failure) !void {
+        const arena = report.arena.allocator();
+        var copy = failure;
+        copy.statement = try arena.dupe(u8, failure.statement);
+        copy.sqlite_message = try arena.dupe(u8, failure.sqlite_message);
+        copy.ours.message = try arena.dupe(u8, failure.ours.message);
+        if (failure.original) |s| copy.original = try arena.dupe(u8, s);
+        if (failure.mutation) |s| copy.mutation = try arena.dupe(u8, s);
+        try report.failures.append(arena, copy);
+    }
+
+    fn addStale(report: *Report, comptime fmt: []const u8, args: anytype) !void {
+        const arena = report.arena.allocator();
+        try report.stale.append(arena, try std.fmt.allocPrint(arena, fmt, args));
+    }
+
+    /// Prints the first failures, the counts and a per-family summary, and fails if
+    /// anything disagreed.
+    fn finish(report: *const Report) !void {
+        const total = report.failures.items.len + report.stale.items.len;
+        if (total == 0) return;
+        for (report.failures.items[0..@min(report.failures.items.len, max_printed)]) |failure| {
+            std.debug.print("{f}", .{failure});
+        }
+        for (report.stale.items) |line| std.debug.print("known_divergences.txt: {s}\n", .{line});
+        std.debug.print("{d} disagreements (at most {d} listed above)\n", .{ total, max_printed });
+        std.debug.print("checked/unknown per family:", .{});
+        for (std.enums.values(Family)) |family| {
+            std.debug.print(" {t}={d}/{d}", .{
+                family, report.checked.get(family), report.skipped_unknown.get(family),
+            });
+        }
+        std.debug.print("\n", .{});
+        return error.TestUnexpectedResult;
+    }
+};
+
+/// What the walk learned about a line of known_divergences.txt.
+const DivergenceState = enum { unvisited, skipped, agreed, disagreed };
+
+/// The `<case id>#<index>` keys of known_divergences.txt.
+fn loadDivergences(arena: std.mem.Allocator, text: []const u8) !std.StringHashMapUnmanaged(DivergenceState) {
+    var map: std.StringHashMapUnmanaged(DivergenceState) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        const key = line[0 .. std.mem.indexOfScalar(u8, line, '\t') orelse line.len];
+        try map.put(arena, key, .unvisited);
+    }
+    return map;
+}
+
+fn checkCorpus(gpa: std.mem.Allocator, report: *Report) !void {
+    var scratch_state: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    var divergences = try loadDivergences(report.arena.allocator(), @embedFile("known_divergences.txt"));
+
+    var it: corpus.Iterator = .init(corpus.sqlite_tests);
+    while (it.next()) |case| {
+        var pos: usize = 0;
+        var index: usize = 0;
+        while (pos < case.sql.len) : (index += 1) {
+            _ = scratch_state.reset(.retain_capacity);
+            const result = try oracle.check(case.sql[pos..]);
+            const statement = case.sql[pos..][0..result.length];
+            pos += result.length;
+
+            const key = try std.fmt.allocPrint(scratch, "{s}#{d}", .{ case.id, index });
+            const state = divergences.getPtr(key);
+            if (state) |s| s.* = .skipped;
+
+            const source = try scratch.dupeSentinel(u8, statement, 0);
+            const family = familyOf(source);
+            if (!isImplemented(family)) continue;
+            if (result.verdict == .unknown) {
+                report.skipped_unknown.getPtr(family).* += 1;
+                continue;
+            }
+            report.checked.getPtr(family).* += 1;
+
+            const ours = try judge(scratch, statement);
+            if (compare(result, ours)) |mismatch| {
+                if (state) |s| {
+                    s.* = .disagreed;
+                    continue;
+                }
+                try report.addFailure(.{
+                    .case_id = case.id,
+                    .index = index,
+                    .statement = statement,
+                    .mismatch = mismatch,
+                    .sqlite_verdict = result.verdict,
+                    .sqlite_message = result.messageText(),
+                    .sqlite_offset = result.error_offset,
+                    .ours = ours,
+                });
+            } else if (state) |s| {
+                s.* = .agreed;
+            }
+        }
+    }
+
+    var entries = divergences.iterator();
+    while (entries.next()) |entry| switch (entry.value_ptr.*) {
+        .unvisited => try report.addStale("{s} names no statement", .{entry.key_ptr.*}),
+        .agreed => try report.addStale("{s} now agrees; remove it", .{entry.key_ptr.*}),
+        .skipped, .disagreed => {},
+    };
+}
+
+test "the parser agrees with SQLite on the corpus" {
+    var report: Report = .init(std.testing.allocator);
+    defer report.deinit();
+    try checkCorpus(std.testing.allocator, &report);
+    try report.finish();
+    try std.testing.expect(report.totalChecked() > 1000);
 }

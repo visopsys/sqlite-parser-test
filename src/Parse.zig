@@ -76,6 +76,13 @@ fn parseStatement(p: *Parse) Error!Node.Index {
     defer p.leave();
     const first = p.peek();
     switch (first) {
+        // Only the prefix up to the token that follows CREATE [TEMP | UNIQUE] is
+        // recognized so far; every statement CREATE can start is still rejected there.
+        .keyword_create => {
+            _ = p.nextToken();
+            if (!p.eat(.keyword_temp)) _ = p.eat(.keyword_unique);
+            return p.failHere();
+        },
         .keyword_begin, .keyword_commit, .keyword_end, .keyword_rollback, .keyword_savepoint, .keyword_release => {},
         else => return p.failHere(),
     }

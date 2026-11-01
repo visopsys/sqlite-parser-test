@@ -381,16 +381,21 @@ fn checkScripts(gpa: std.mem.Allocator, report: *Report) !void {
     while (it.next()) |case| {
         _ = scratch_state.reset(.retain_capacity);
         if (hasDivergence(divergences, case.id)) continue;
-        const result = try scriptOutcome(case.sql);
-        if (result.verdict == .unknown) {
-            report.skipped_unknown += 1;
-            continue;
-        }
-        report.checked += 1;
-        const ours = try judge(scratch, case.sql);
-        if (compare(result, ours)) |mismatch| {
-            try report.addFailure(failureOf(.{ .case_id = case.id, .index = 0 }, case.sql, mismatch, result, ours));
-        }
+        try checkScript(report, scratch, .{ .case_id = case.id, .index = 0 }, case.sql);
+    }
+}
+
+/// Compares our single parse of `script` with SQLite's walk of it.
+fn checkScript(report: *Report, scratch: std.mem.Allocator, origin: Origin, script: []const u8) !void {
+    const result = try scriptOutcome(script);
+    if (result.verdict == .unknown) {
+        report.skipped_unknown += 1;
+        return;
+    }
+    report.checked += 1;
+    const ours = try judge(scratch, script);
+    if (compare(result, ours)) |mismatch| {
+        try report.addFailure(failureOf(origin, script, mismatch, result, ours));
     }
 }
 
@@ -423,14 +428,20 @@ const operators = [_][]const u8{
 };
 const literals = [_][]const u8{ "1", "1.5", "'s'", "x'00'", "?", "abc", "\"q\"" };
 
+const vocabulary_size = sqlite_parser.tokenizer.keywords.keys().len + operators.len + literals.len;
+
+/// The `i`th keyword, operator or literal, for `i < vocabulary_size`.
+fn vocabularyAt(index: usize) []const u8 {
+    const keyword_keys = sqlite_parser.tokenizer.keywords.keys();
+    if (index < keyword_keys.len) return keyword_keys[index];
+    const rest = index - keyword_keys.len;
+    if (rest < operators.len) return operators[rest];
+    return literals[rest - operators.len];
+}
+
 /// A random keyword, operator or literal.
 fn vocabularyToken(random: std.Random) []const u8 {
-    const keyword_keys = sqlite_parser.tokenizer.keywords.keys();
-    var i = random.uintLessThan(usize, keyword_keys.len + operators.len + literals.len);
-    if (i < keyword_keys.len) return keyword_keys[i];
-    i -= keyword_keys.len;
-    if (i < operators.len) return operators[i];
-    return literals[i - operators.len];
+    return vocabularyAt(random.uintLessThan(usize, vocabulary_size));
 }
 
 const Mutation = enum { delete, duplicate, swap, replace, insert, truncate };
@@ -536,21 +547,103 @@ test "the parser agrees with SQLite on mutants of the corpus" {
     try std.testing.expect(compared >= min_mutants);
 }
 
-fn fuzzStatement(_: void, smith: *std.testing.Smith) !void {
-    var raw: [256]u8 = undefined;
-    const len = smith.slice(&raw);
-    const input = raw[0 .. std.mem.indexOfScalar(u8, raw[0..len], 0) orelse len];
+/// Compares `input` with SQLite as one statement, or as a script when SQLite splits it.
+fn checkInput(report: *Report, scratch: std.mem.Allocator, input: []const u8) !void {
+    const origin: Origin = .{ .case_id = "fuzz", .index = 0 };
+    const result = try oracle.check(input);
+    if (result.length >= input.len) {
+        _ = try checkStatement(report, scratch, origin, input, result, null);
+    } else {
+        try checkScript(report, scratch, origin, input);
+    }
+}
+
+fn checkFuzzInput(input: []const u8) !void {
     var report: Report = .init(std.testing.allocator);
     defer report.deinit();
     var scratch_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer scratch_state.deinit();
-    const result = try oracle.check(input);
-    if (result.length >= input.len) {
-        _ = try checkStatement(&report, scratch_state.allocator(), .{ .case_id = "fuzz", .index = 0 }, input, result, null);
-    }
+    try checkInput(&report, scratch_state.allocator(), input);
     try report.finish();
 }
 
+fn fuzzStatement(_: void, smith: *std.testing.Smith) !void {
+    var raw: [1024]u8 = undefined;
+    const len = smith.slice(&raw);
+    try checkFuzzInput(raw[0 .. std.mem.indexOfScalar(u8, raw[0..len], 0) orelse len]);
+}
+
+const seed_statements = 64;
+
+/// The first corpus statements, each encoded the way `Smith.slice` reads it.
+fn byteSeeds(arena: std.mem.Allocator) ![]const []const u8 {
+    var seeds: std.ArrayList([]const u8) = .empty;
+    var statements = std.mem.splitScalar(u8, corpus.sqlite_tests, ';');
+    while (statements.next()) |statement| {
+        if (seeds.items.len == seed_statements) break;
+        const text = statement[0..@min(statement.len, 1020)];
+        const seed = try arena.alloc(u8, 4 + text.len);
+        std.mem.writeInt(u32, seed[0..4], @intCast(text.len), .little);
+        @memcpy(seed[4..], text);
+        try seeds.append(arena, seed);
+    }
+    return seeds.items;
+}
+
 test "fuzz: the parser agrees with SQLite on arbitrary input" {
-    try std.testing.fuzz({}, fuzzStatement, .{});
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.fuzz({}, fuzzStatement, .{ .corpus = try byteSeeds(arena_state.allocator()) });
+}
+
+const max_fuzz_tokens = 64;
+const max_corpus_token_len = 64;
+
+fn fuzzTokens(_: void, smith: *std.testing.Smith) !void {
+    var input: [max_fuzz_tokens * (max_corpus_token_len + 1)]u8 = undefined;
+    var len: usize = 0;
+    var count: usize = 0;
+    while (count < max_fuzz_tokens and !smith.eos()) : (count += 1) {
+        const text = if (smith.boolWeighted(1, 3)) corpusToken(smith.index(corpus.sqlite_tests.len)) else vocabularyAt(smith.index(vocabulary_size));
+        if (len > 0) {
+            input[len] = ' ';
+            len += 1;
+        }
+        @memcpy(input[len..][0..text.len], text);
+        len += text.len;
+    }
+    try checkFuzzInput(input[0..len]);
+}
+
+/// The first token at or after byte `offset` of the corpus, or nothing when it is
+/// longer than `max_corpus_token_len` or the corpus ends.
+fn corpusToken(offset: usize) []const u8 {
+    const source = corpus.sqlite_tests[offset.. :0];
+    var t: Tokenizer = .init(source);
+    const token = t.next();
+    if (token.loc.end - token.loc.start > max_corpus_token_len) return "";
+    return source[token.loc.start..token.loc.end];
+}
+
+/// Token-fuzzer input that takes the corpus token at each of `offsets`.
+fn tokenSeed(comptime offsets: []const u64) []const u8 {
+    return comptime blk: {
+        var seed: [offsets.len * 17 + 1]u8 = undefined;
+        for (offsets, 0..) |offset, i| {
+            seed[i * 17] = 0;
+            seed[i * 17 + 1 ..][0..8].* = @bitCast(@as(u64, 1));
+            seed[i * 17 + 9 ..][0..8].* = @bitCast(offset);
+        }
+        seed[offsets.len * 17] = 1;
+        const final = seed;
+        break :blk &final;
+    };
+}
+
+test "fuzz: the parser agrees with SQLite on token sequences" {
+    try std.testing.fuzz({}, fuzzTokens, .{ .corpus = &.{
+        tokenSeed(&.{ 0, 40, 200 }),
+        tokenSeed(&.{ 5_000, 5_100, 5_200, 5_300 }),
+        tokenSeed(&.{ 90_000, 90_050 }),
+    } });
 }

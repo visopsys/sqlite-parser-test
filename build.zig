@@ -18,7 +18,9 @@ pub fn build(b: *std.Build) void {
     // Tests that compare against the real SQLite. They link the system SQLite
     // 3.45.1 library through the C oracle in test/oracle/; the library above
     // never does.
-    const oracle_tests = b.addTest(.{ .root_module = b.createModule(.{
+    // Fuzz mode needs the LLVM backend, and SQLite's C must not be built with the
+    // coverage instrumentation that only Zig's fuzzer runtime provides.
+    const oracle_tests = b.addTest(.{ .use_llvm = true, .root_module = b.createModule(.{
         .root_source_file = b.path("test/all.zig"),
         .target = target,
         .optimize = optimize,
@@ -27,7 +29,7 @@ pub fn build(b: *std.Build) void {
     }) });
     oracle_tests.root_module.addCSourceFile(.{
         .file = b.path("test/oracle/oracle.c"),
-        .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" },
+        .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror", "-fno-sanitize-coverage=trace-cmp,trace-pc-guard,inline-8bit-counters,pc-table,indirect-calls" },
     });
     oracle_tests.root_module.addIncludePath(b.path("test/oracle"));
     oracle_tests.root_module.linkSystemLibrary("sqlite3", .{});

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # The oracle is the system SQLite. ubuntu-24.04 ships 3.45.1, the version the
+    # parser targets; test/oracle.zig fails if it is anything else.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SQLite development library
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Check formatting
+        run: zig fmt --check build.zig src test
+      - name: Build
+        run: zig build --summary all
+      - name: Test
+        run: zig build test --summary all

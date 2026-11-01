@@ -36,7 +36,7 @@ pub const Family = enum {
 };
 
 /// The families whose statements the differential tests check.
-const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced, .insert, .update, .delete, .create_table, .alter_table, .create_index, .create_view, .drop };
+const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced, .insert, .update, .delete, .create_table, .alter_table, .create_index, .create_view, .create_virtual_table, .drop };
 
 fn isImplemented(family: Family) bool {
     return std.mem.indexOfScalar(Family, &implemented, family) != null;
@@ -178,6 +178,10 @@ fn compare(result: oracle.Result, ours: Outcome) ?Mismatch {
         .accept => true,
         .reject => false,
     };
+    // A collation error is raised while the parser reduces the constraint. When the
+    // statement ends at the token that triggers it, the oracle reports it as an
+    // accept although the text may be incomplete, so no verdict can be compared.
+    if (accepted and !ours.accepted and std.mem.startsWith(u8, result.messageText(), "no such collation sequence: ")) return null;
     if (accepted != ours.accepted) return .verdict;
     if (accepted) return null;
     const expected = result.messageText();

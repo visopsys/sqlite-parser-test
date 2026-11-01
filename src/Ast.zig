@@ -226,6 +226,18 @@ pub const Node = struct {
         };
     };
 
+    /// The record `Tag.create_virtual_table` points to in `extra_data`; absent tokens are 0.
+    pub const CreateVirtualTable = extern struct {
+        if_not_exists: bool,
+        schema: u32,
+        name: u32,
+        module: u32,
+        /// The first argument token and the `)` that ends the list; `args_start` is 0
+        /// without a parenthesized list, and equals `args_end` for `m()`.
+        args_start: u32,
+        args_end: u32,
+    };
+
     /// The record `Tag.drop` points to in `extra_data`; absent tokens are 0.
     pub const Drop = extern struct {
         kind: Kind,
@@ -461,6 +473,10 @@ pub const Node = struct {
         /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateView`.
         /// `rhs` is the query node.
         create_view,
+        /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] [schema.]name USING module [(args)]`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a
+        /// `Node.CreateVirtualTable`.
+        create_virtual_table,
         /// `DROP TABLE|VIEW|INDEX|TRIGGER [IF EXISTS] [schema.]name`. `main_token` is `DROP`.
         /// `lhs` is the `extra_data` index of a `Node.Drop`.
         drop,
@@ -731,6 +747,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .alter_table => try self.renderAlterTable(n, writer),
         .create_index => try self.renderCreateIndex(n, writer),
         .create_view => try self.renderCreateView(n, writer),
+        .create_virtual_table => try self.renderCreateVirtualTable(n, writer),
         .drop => try self.renderDrop(n, writer),
         .insert => try self.renderInsert(n, writer),
         .update => try self.renderUpdate(n, writer),
@@ -856,6 +873,32 @@ fn renderCreateView(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Er
     if (t.columns_end != t.columns_start) try writer.writeByte(')');
     try writer.writeAll(" AS ");
     try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+}
+
+fn renderCreateVirtualTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateVirtualTable = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateVirtualTable) / 4]);
+    try writer.writeAll("CREATE VIRTUAL TABLE ");
+    if (t.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    try writer.writeAll(" USING ");
+    try self.renderName(t.module, writer);
+    if (t.args_start == 0) return;
+    const tags = self.tokens.items(.tag);
+    try writer.writeByte('(');
+    for (t.args_start..t.args_end) |i| {
+        if (tags[i] == .comma) {
+            try writer.writeAll(", ");
+            continue;
+        }
+        const glued = i == t.args_start or tags[i - 1] == .l_paren or tags[i - 1] == .comma or tags[i] == .r_paren;
+        if (!glued) try writer.writeByte(' ');
+        try writer.writeAll(self.tokenText(@fromBackingInt(@intCast(i))));
+    }
+    try writer.writeByte(')');
 }
 
 fn renderDrop(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2716,4 +2759,38 @@ test "CREATE TABLE errors" {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
     }
     try expectError("CREATE TABLE t(\n  a,\n  b) FOO", "unknown table option: FOO", .{ .byte_offset = 26, .line = 3, .column = 6 });
+}
+
+test "CREATE VIRTUAL TABLE" {
+    const cases = [_][2][:0]const u8{
+        .{ "create virtual table t using m", "CREATE VIRTUAL TABLE t USING m;\n" },
+        .{ "create virtual table if not exists main.'t' using 'm'", "CREATE VIRTUAL TABLE IF NOT EXISTS main.t USING m;\n" },
+        .{ "create virtual table t using m()", "CREATE VIRTUAL TABLE t USING m();\n" },
+        .{ "create virtual table t using m(a);", "CREATE VIRTUAL TABLE t USING m(a);\n" },
+        .{ "CREATE VIRTUAL TABLE t USING fts5(a,b,tokenize='porter')", "CREATE VIRTUAL TABLE t USING fts5(a, b, tokenize = 'porter');\n" },
+        .{ "create virtual table t using m(a, b(c,d), x=1)", "CREATE VIRTUAL TABLE t USING m(a, b (c, d), x = 1);\n" },
+        .{ "create virtual table t using m((a b) c, ((d)))", "CREATE VIRTUAL TABLE t USING m((a b) c, ((d)));\n" },
+        .{ "create virtual table t using m(select from, not null + 1; x)", "CREATE VIRTUAL TABLE t USING m(select from, not null + 1 ; x);\n" },
+        .{ "create virtual table t using m(a,,b)", "CREATE VIRTUAL TABLE t USING m(a, , b);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE VIRTUAL TABLE errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE VIRTUAL TABLE", "incomplete input", 20 },
+        .{ "CREATE VIRTUAL TABLE t USING", "incomplete input", 28 },
+        .{ "CREATE VIRTUAL TABLE t USING m(", "incomplete input", 31 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a", "incomplete input", 32 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a))", "near \")\": syntax error", 33 },
+        .{ "CREATE VIRTUAL TABLE t USING m(((a))", "incomplete input", 36 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a;", "incomplete input", 33 },
+        .{ "CREATE TEMP VIRTUAL TABLE t USING m", "near \"VIRTUAL\": syntax error", 12 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a) x", "near \"x\": syntax error", 34 },
+        .{ "CREATE VIRTUAL TABLE t USING m(a $)", "unrecognized token: \"$\"", 33 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
 }

@@ -512,6 +512,7 @@ fn parseCreate(p: *Parse) Error!Node.Index {
     const unique = !temp and p.eat(.keyword_unique);
     if (p.peek() == .keyword_index and !temp) return p.parseCreateIndex(create, unique);
     if (p.peek() == .keyword_view and !unique) return p.parseCreateView(create, temp);
+    if (p.peek() == .keyword_virtual and !temp and !unique) return p.parseCreateVirtualTable(create);
     if (unique or !p.eat(.keyword_table)) return p.failHere();
     return p.parseCreateTable(create, temp);
 }
@@ -548,6 +549,48 @@ fn parseCreateView(p: *Parse, create: TokenIndex, temp: bool) Error!Node.Index {
         .tag = .create_view,
         .main_token = create,
         .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = @backingInt(query) },
+    });
+}
+
+/// `VIRTUAL TABLE ifnotexists nm dbnm USING nm [LP vtabarglist RP]`, after `CREATE`. The
+/// arguments are `%wildcard ANY` tokens: everything, `;` and keywords included, up to the
+/// `)` that balances the opening one.
+fn parseCreateVirtualTable(p: *Parse, create: TokenIndex) Error!Node.Index {
+    _ = p.nextToken();
+    if (!p.eat(.keyword_table)) return p.failHere();
+    var record: Node.CreateVirtualTable = std.mem.zeroes(Node.CreateVirtualTable);
+    if (p.eat(.keyword_if)) {
+        if (!p.eat(.keyword_not) or !p.eat(.keyword_exists)) return p.failHere();
+        record.if_not_exists = true;
+    }
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    if (!p.eat(.keyword_using)) return p.failHere();
+    record.module = try p.parseName(.nm);
+    if (p.eat(.l_paren)) {
+        record.args_start = p.tok_i;
+        var nesting: u32 = 0;
+        while (true) {
+            switch (p.peek()) {
+                .eof, .invalid => return p.failHere(),
+                .l_paren => nesting += 1,
+                .r_paren => if (nesting == 0) break else {
+                    nesting -= 1;
+                },
+                else => {},
+            }
+            _ = p.nextToken();
+        }
+        record.args_end = p.tok_i;
+        _ = p.nextToken();
+    }
+    return p.addNode(.{
+        .tag = .create_virtual_table,
+        .main_token = create,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
     });
 }
 

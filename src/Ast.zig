@@ -191,6 +191,20 @@ pub const Node = struct {
         };
     };
 
+    /// The record `Tag.alter_table` points to in `extra_data`; absent tokens are 0.
+    pub const AlterTable = extern struct {
+        action: Action,
+        schema: u32,
+        name: u32,
+        /// The new table name, the old column name, the dropped column name, or the
+        /// `column_def` node of `add_column`.
+        first: u32,
+        /// The new column name of `rename_column`.
+        second: u32,
+
+        pub const Action = enum(u32) { rename_to, rename_column, add_column, drop_column };
+    };
+
     /// The record of `Tag.constraint_key`: the key columns are the `order_item` nodes in
     /// `list_start..list_end`; the other tokens are 0 when absent.
     pub const Key = extern struct {
@@ -392,6 +406,9 @@ pub const Node = struct {
         /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateTable`.
         /// `rhs` is the query node of the `AS` form, else 0.
         create_table,
+        /// `ALTER TABLE [schema.]name action`. `main_token` is `ALTER`. `lhs` is the
+        /// `extra_data` index of a `Node.AlterTable`.
+        alter_table,
         /// `name [type] constraints..`. `main_token` is the name. `lhs` is the `extra_data`
         /// index of the first and the end token of the type (equal when there is none), the
         /// constraint count and the constraint nodes.
@@ -656,6 +673,7 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
         },
         .create_table => try self.renderCreateTable(n, writer),
+        .alter_table => try self.renderAlterTable(n, writer),
         .insert => try self.renderInsert(n, writer),
         .update => try self.renderUpdate(n, writer),
         .delete => try self.renderDelete(n, writer),
@@ -741,6 +759,30 @@ fn renderCreateTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.E
     try writer.writeByte(')');
     if (t.flags.without_rowid) try writer.writeAll(" WITHOUT ROWID");
     if (t.flags.strict) try writer.writeAll(if (t.flags.without_rowid) ", STRICT" else " STRICT");
+}
+
+fn renderAlterTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.AlterTable = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.AlterTable) / 4]);
+    try writer.writeAll("ALTER TABLE ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    switch (t.action) {
+        .rename_to => try writer.writeAll(" RENAME TO "),
+        .rename_column => try writer.writeAll(" RENAME COLUMN "),
+        .add_column => {
+            try writer.writeAll(" ADD COLUMN ");
+            return self.renderColumnDef(self.nodes.get(t.first), writer);
+        },
+        .drop_column => try writer.writeAll(" DROP COLUMN "),
+    }
+    try self.renderName(t.first, writer);
+    if (t.action == .rename_column) {
+        try writer.writeAll(" TO ");
+        try self.renderName(t.second, writer);
+    }
 }
 
 fn renderColumnDef(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2405,6 +2447,41 @@ test "CREATE TABLE table constraints" {
         .{ "create table t(a, b, foreign key(a, b) references p not deferrable)", "CREATE TABLE t (a, b, FOREIGN KEY (a, b) REFERENCES p NOT DEFERRABLE);\n" },
     };
     for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "ALTER TABLE" {
+    const cases = [_][2][:0]const u8{
+        .{ "alter table t rename to u", "ALTER TABLE t RENAME TO u;\n" },
+        .{ "alter table m.t rename to 'u'", "ALTER TABLE m.t RENAME TO u;\n" },
+        .{ "alter table m.t rename column a to b", "ALTER TABLE m.t RENAME COLUMN a TO b;\n" },
+        .{ "alter table t rename a to b", "ALTER TABLE t RENAME COLUMN a TO b;\n" },
+        .{ "alter table t drop column a", "ALTER TABLE t DROP COLUMN a;\n" },
+        .{ "alter table t drop a", "ALTER TABLE t DROP COLUMN a;\n" },
+        .{ "alter table t add a", "ALTER TABLE t ADD COLUMN a;\n" },
+        .{ "alter table t add column a", "ALTER TABLE t ADD COLUMN a;\n" },
+        .{ "alter table main.t add b int not null default 0 references p(x)", "ALTER TABLE main.t ADD COLUMN b int NOT NULL DEFAULT 0 REFERENCES p (x);\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "ALTER TABLE errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "ALTER TABLE t", "incomplete input", 13 },
+        .{ "ALTER TABLE t RENAME", "incomplete input", 20 },
+        .{ "ALTER TABLE t FOO", "near \"FOO\": syntax error", 14 },
+        .{ "ALTER TABLE t ADD", "incomplete input", 17 },
+        .{ "ALTER TABLE t ADD column", "incomplete input", 24 },
+        .{ "ALTER TABLE t DROP column", "incomplete input", 25 },
+        .{ "ALTER TABLE t DROP 1", "near \"1\": syntax error", 19 },
+        .{ "ALTER TABLE t RENAME TO TO", "near \"TO\": syntax error", 24 },
+        .{ "ALTER TABLE t RENAME column TO x", "near \"TO\": syntax error", 28 },
+        .{ "ALTER TABLE t RENAME a b", "near \"b\": syntax error", 23 },
+        .{ "ALTER INDEX i", "near \"INDEX\": syntax error", 6 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
 }
 
 test "CREATE TABLE errors" {

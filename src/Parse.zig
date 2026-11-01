@@ -93,6 +93,7 @@ fn parseStatement(p: *Parse) Error!Node.Index {
         .keyword_update => return p.parseUpdate(),
         .keyword_delete => return p.parseDelete(),
         .keyword_create => return p.parseCreate(),
+        .keyword_alter => return p.parseAlterTable(),
         .keyword_pragma => return p.parsePragma(),
         .keyword_attach => return p.parseAttach(),
         .keyword_detach => return p.parseDetach(),
@@ -536,6 +537,52 @@ fn parseCreate(p: *Parse) Error!Node.Index {
         .tag = .create_table,
         .main_token = create,
         .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = query },
+    });
+}
+
+/// `cmd ::= ALTER TABLE fullname action`. COLUMN has its own meaning after RENAME, ADD and
+/// DROP, so it is never the column name there.
+fn parseAlterTable(p: *Parse) Error!Node.Index {
+    const alter = p.nextToken();
+    if (!p.eat(.keyword_table)) return p.failHere();
+    var record: Node.AlterTable = std.mem.zeroes(Node.AlterTable);
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    switch (p.peek()) {
+        .keyword_rename => {
+            _ = p.nextToken();
+            if (p.eat(.keyword_to)) {
+                record.action = .rename_to;
+                record.first = try p.parseName(.nm);
+            } else {
+                _ = p.eat(.keyword_columnkw);
+                record.action = .rename_column;
+                record.first = try p.parseName(.nm);
+                if (!p.eat(.keyword_to)) return p.failHere();
+                record.second = try p.parseName(.nm);
+            }
+        },
+        .keyword_add => {
+            _ = p.nextToken();
+            _ = p.eat(.keyword_columnkw);
+            record.action = .add_column;
+            record.first = @backingInt(try p.parseColumnDef());
+        },
+        .keyword_drop => {
+            _ = p.nextToken();
+            _ = p.eat(.keyword_columnkw);
+            record.action = .drop_column;
+            record.first = try p.parseName(.nm);
+        },
+        else => return p.failHere(),
+    }
+    return p.addNode(.{
+        .tag = .alter_table,
+        .main_token = alter,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
     });
 }
 

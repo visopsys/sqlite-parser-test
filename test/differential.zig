@@ -36,7 +36,7 @@ pub const Family = enum {
 };
 
 /// The families whose statements the differential tests check.
-const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced, .insert, .update, .delete };
+const implemented = [_]Family{ .empty, .transaction, .pragma, .attach, .maintenance, .other, .select_expressions, .select, .select_advanced, .insert, .update, .delete, .create_table, .alter_table };
 
 fn isImplemented(family: Family) bool {
     return std.mem.indexOfScalar(Family, &implemented, family) != null;
@@ -178,7 +178,12 @@ fn compare(result: oracle.Result, ours: Outcome) ?Mismatch {
         .accept => true,
         .reject => false,
     };
-    if (accepted != ours.accepted) return .verdict;
+    if (accepted != ours.accepted) {
+        // SQLite stopped at a semantic error raised on the statement's last token, such
+        // as an unknown database, so it never saw that the statement ends too early.
+        const hidden = accepted and result.messageText().len != 0 and std.mem.eql(u8, ours.message, "incomplete input");
+        return if (hidden) null else .verdict;
+    }
     if (accepted) return null;
     const expected = result.messageText();
     // The oracle's buffer cuts a longer message short, so only its prefix is known.
@@ -266,6 +271,12 @@ test "compare accepts agreement" {
 test "compare skips unknown verdicts" {
     const result = try check("CREATE TABLE t(a, a, b garbage(");
     try std.testing.expectEqual(null, compare(result, .{ .accepted = true, .message = "", .offset = null }));
+}
+
+test "compare skips a semantic error on the last token" {
+    const result = try check("CREATE TABLE aux5 . t5 (");
+    try std.testing.expectEqual(null, compare(result, .{ .accepted = false, .message = "incomplete input", .offset = 24 }));
+    try std.testing.expectEqual(Mismatch.verdict, compare(result, .{ .accepted = false, .message = "near \"(\": syntax error", .offset = 22 }));
 }
 
 test "compare ignores our offset when SQLite names none" {

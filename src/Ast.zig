@@ -76,7 +76,37 @@ pub const Node = struct {
         order_end: u32,
         limit: u32,
         offset: u32,
+        window_start: u32,
+        window_end: u32,
     };
+
+    /// The record `Tag.window_def` points to in `extra_data`. Tokens and nodes that are
+    /// absent are 0 (the base name and the frame unit follow `(`, so neither is token 0).
+    pub const Window = extern struct {
+        base: u32,
+        partition_start: u32,
+        partition_end: u32,
+        order_start: u32,
+        order_end: u32,
+        /// The `RANGE`, `ROWS` or `GROUPS` token, or 0 when there is no frame.
+        frame_unit: u32,
+        start: FrameBound,
+        start_expr: u32,
+        /// `none` unless the frame has the `BETWEEN start AND end` form.
+        end: FrameBound,
+        end_expr: u32,
+        exclude: FrameExclude,
+    };
+
+    /// One end of a window frame; `start_expr` and `end_expr` of `Window` are the offset
+    /// expression of `preceding` and `following`.
+    pub const FrameBound = enum(u32) { none, unbounded_preceding, unbounded_following, current_row, preceding, following };
+
+    /// The `EXCLUDE` option of a window frame.
+    pub const FrameExclude = enum(u32) { none, no_others, current_row, group, ties };
+
+    /// Whether a CTE says `MATERIALIZED`, `NOT MATERIALIZED` or neither.
+    pub const Materialized = enum(u32) { any, yes, no };
 
     pub const Tag = enum {
         /// The statement list. `lhs..rhs` is the range of `extra_data` holding the
@@ -119,6 +149,24 @@ pub const Node = struct {
         /// `SELECT [DISTINCT | ALL] columns [FROM ..] [WHERE ..] [GROUP BY ..] [HAVING ..]
         /// [ORDER BY ..] [LIMIT ..]`. `lhs` is the `extra_data` index of a `Node.Select`.
         select,
+        /// `WITH [RECURSIVE] cte, .. query`. `main_token` is `WITH`. `lhs` is the `extra_data`
+        /// index of the `RECURSIVE` flag (0 or 1), the number of CTEs and the `cte` nodes.
+        /// `rhs` is the query node (`select`, `compound` or `values`).
+        with_clause,
+        /// `name [(columns)] AS [[NOT] MATERIALIZED] (query)`. `main_token` is the name.
+        /// `lhs` is the query node. `rhs` is the `extra_data` index of a `Materialized`,
+        /// the column count and the column name tokens.
+        cte,
+        /// A window definition, `base PARTITION BY .. ORDER BY .. frame`. `lhs` is the
+        /// `extra_data` index of a `Node.Window`. `main_token` is the window's name in a
+        /// `WINDOW` clause and the `(` in `OVER (..)`.
+        window_def,
+        /// `OVER name`. `main_token` is the name.
+        window_ref,
+        /// `FILTER (WHERE lhs) OVER rhs` after a function call; `lhs` is the filter
+        /// expression and `rhs` the `window_def` or `window_ref` node, each 0 when absent.
+        /// `main_token` is the first of the two keywords.
+        filter_over,
         /// `lhs UNION [ALL] | INTERSECT | EXCEPT rhs` of `select`, `values` or `compound`
         /// nodes. `main_token` is the operator; for `UNION ALL` the next token is `ALL`.
         compound,
@@ -208,11 +256,12 @@ pub const Node = struct {
         /// `RAISE(IGNORE)` or `RAISE(kind, message)`. `main_token` is `RAISE`. `lhs` is the
         /// kind token and `rhs` the message name token, 0 for `IGNORE`.
         raise,
-        /// `name([DISTINCT | ALL] args [ORDER BY items])`. `main_token` is the name. `lhs`
-        /// is the `extra_data` index of the quantifier (`call_distinct` or `call_all`, else
-        /// 0), the argument count, the arguments, the item count and the `order_item` nodes.
+        /// `name([DISTINCT | ALL] args [ORDER BY items]) [filter_over]`. `main_token` is the
+        /// name. `lhs` is the `extra_data` index of the quantifier (`call_distinct` or
+        /// `call_all`, else 0), the argument count, the arguments, the item count and the
+        /// `order_item` nodes. `rhs` is the `filter_over` node or 0.
         call,
-        /// `name(*)`. `main_token` is the name.
+        /// `name(*) [filter_over]`. `main_token` is the name; `rhs` is as for `call`.
         call_star,
         /// `(select)` as an expression; `lhs` is the query node. `main_token` is the `(`.
         subquery,
@@ -252,6 +301,9 @@ pub const Error = struct {
         limit_after_union,
         /// Blamed on the `ON` or `USING` of a `FROM` item that has no join before it.
         join_clause_required,
+        /// Blamed on the token after a `COLLATE`, `ASC` or `DESC` in a CTE column list;
+        /// the message names the column.
+        syntax_error_after_column_name,
     };
 };
 
@@ -334,6 +386,12 @@ pub fn renderError(self: Ast, err: Error, writer: *std.Io.Writer) std.Io.Writer.
         .join_clause_required => {
             try writer.writeAll("a JOIN clause is required before ");
             try writeUpper(text, writer);
+        },
+        .syntax_error_after_column_name => {
+            const tags = self.tokens.items(.tag);
+            var column: u32 = @backingInt(err.token);
+            while (tags[column - 1] != .comma and tags[column - 1] != .l_paren) column -= 1;
+            try writer.print("syntax error after column name \"{s}\"", .{self.tokenText(@fromBackingInt(column))});
         },
     }
 }
@@ -448,6 +506,16 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
             }
         },
         .select => try self.renderSelect(n, writer),
+        .with_clause => {
+            const ctes = self.extra_data[n.data.lhs + 2 ..][0..self.extra_data[n.data.lhs + 1]];
+            try writer.writeAll(if (self.extra_data[n.data.lhs] != 0) "WITH RECURSIVE " else "WITH ");
+            for (ctes, 0..) |cte, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try self.renderCte(@fromBackingInt(@intCast(cte)), writer);
+            }
+            try writer.writeByte(' ');
+            try self.renderStatement(@fromBackingInt(@intCast(n.data.rhs)), writer);
+        },
         .compound => {
             try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
             try writer.writeByte(' ');
@@ -493,7 +561,105 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         .subquery,
         .exists,
         .in_select,
+        .cte,
+        .window_def,
+        .window_ref,
+        .filter_over,
         => unreachable,
+    }
+}
+
+fn renderCte(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = self.nodes.get(@backingInt(node));
+    const materialized: Node.Materialized = @fromBackingInt(@intCast(self.extra_data[n.data.rhs]));
+    const columns = self.extra_data[n.data.rhs + 2 ..][0..self.extra_data[n.data.rhs + 1]];
+    try self.renderName(@backingInt(n.main_token), writer);
+    if (columns.len > 0) {
+        try writer.writeByte('(');
+        for (columns, 0..) |column, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try self.renderName(column, writer);
+        }
+        try writer.writeByte(')');
+    }
+    try writer.writeAll(switch (materialized) {
+        .any => " AS (",
+        .yes => " AS MATERIALIZED (",
+        .no => " AS NOT MATERIALIZED (",
+    });
+    try self.renderStatement(@fromBackingInt(@intCast(n.data.lhs)), writer);
+    try writer.writeByte(')');
+}
+
+fn renderWindowDef(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = self.nodes.get(@backingInt(node));
+    const w: *const Node.Window = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Window) / 4]);
+    var separator: []const u8 = "";
+    try writer.writeByte('(');
+    if (w.base != 0) {
+        try self.renderName(w.base, writer);
+        separator = " ";
+    }
+    if (w.partition_start != w.partition_end) {
+        try writer.print("{s}PARTITION BY ", .{separator});
+        try self.renderExprRange(w.partition_start, w.partition_end, writer);
+        separator = " ";
+    }
+    if (w.order_start != w.order_end) {
+        try writer.print("{s}ORDER BY ", .{separator});
+        try self.renderExprRange(w.order_start, w.order_end, writer);
+        separator = " ";
+    }
+    if (w.frame_unit != 0) {
+        try writer.writeAll(separator);
+        try writeUpper(self.tokenText(@fromBackingInt(w.frame_unit)), writer);
+        if (w.end == .none) {
+            try writer.writeByte(' ');
+            try self.renderFrameBound(w.start, w.start_expr, writer);
+        } else {
+            try writer.writeAll(" BETWEEN ");
+            try self.renderFrameBound(w.start, w.start_expr, writer);
+            try writer.writeAll(" AND ");
+            try self.renderFrameBound(w.end, w.end_expr, writer);
+        }
+        try writer.writeAll(switch (w.exclude) {
+            .none => "",
+            .no_others => " EXCLUDE NO OTHERS",
+            .current_row => " EXCLUDE CURRENT ROW",
+            .group => " EXCLUDE GROUP",
+            .ties => " EXCLUDE TIES",
+        });
+    }
+    try writer.writeByte(')');
+}
+
+fn renderFrameBound(self: Ast, bound: Node.FrameBound, expr: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (bound) {
+        .none => unreachable,
+        .unbounded_preceding => try writer.writeAll("UNBOUNDED PRECEDING"),
+        .unbounded_following => try writer.writeAll("UNBOUNDED FOLLOWING"),
+        .current_row => try writer.writeAll("CURRENT ROW"),
+        .preceding, .following => {
+            try self.renderExpr(@fromBackingInt(@intCast(expr)), writer);
+            try writer.writeAll(if (bound == .preceding) " PRECEDING" else " FOLLOWING");
+        },
+    }
+}
+
+fn renderFilterOver(self: Ast, node: u32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (node == 0) return;
+    const n = self.nodes.get(node);
+    if (n.data.lhs != 0) {
+        try writer.writeAll(" FILTER (WHERE ");
+        try self.renderExpr(@fromBackingInt(@intCast(n.data.lhs)), writer);
+        try writer.writeByte(')');
+    }
+    if (n.data.rhs == 0) return;
+    try writer.writeAll(" OVER ");
+    if (self.nodes.items(.tag)[n.data.rhs] == .window_ref) {
+        try self.renderName(@backingInt(self.nodes.items(.main_token)[n.data.rhs]), writer);
+    } else {
+        try self.renderWindowDef(@fromBackingInt(@intCast(n.data.rhs)), writer);
     }
 }
 
@@ -514,6 +680,13 @@ fn renderSelect(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!
         try self.renderExprRange(s.group_start, s.group_end, writer);
     }
     try self.renderClause(" HAVING ", s.having, writer);
+    for (self.extra_data[s.window_start..s.window_end], 0..) |window, i| {
+        try writer.writeAll(if (i == 0) " WINDOW " else ", ");
+        const node: Node.Index = @fromBackingInt(@intCast(window));
+        try self.renderName(@backingInt(self.nodes.items(.main_token)[@backingInt(node)]), writer);
+        try writer.writeAll(" AS ");
+        try self.renderWindowDef(node, writer);
+    }
     if (s.order_start != s.order_end) {
         try writer.writeAll(" ORDER BY ");
         try self.renderExprRange(s.order_start, s.order_end, writer);
@@ -563,7 +736,7 @@ fn renderFrom(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
             const inner: Node.Index = @fromBackingInt(@intCast(n.data.lhs));
             try writer.writeByte('(');
             switch (self.nodes.items(.tag)[@backingInt(inner)]) {
-                .select, .compound, .values => try self.renderStatement(inner, writer),
+                .select, .compound, .values, .with_clause => try self.renderStatement(inner, writer),
                 else => try self.renderFrom(inner, writer),
             }
             try writer.writeByte(')');
@@ -738,6 +911,7 @@ fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
         .call_star => {
             try self.renderName(main_token, writer);
             try writer.writeAll("(*)");
+            try self.renderFilterOver(n.data.rhs, writer);
         },
         .call => {
             const parts = self.extra_data[n.data.lhs..];
@@ -759,6 +933,7 @@ fn renderExpr(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.Writer
                 try self.renderExpr(@fromBackingInt(@intCast(item)), writer);
             }
             try writer.writeByte(')');
+            try self.renderFilterOver(n.data.rhs, writer);
         },
         .order_item => {
             const flags: Node.SortFlags = @bitCast(n.data.rhs);
@@ -1387,7 +1562,6 @@ test "CAST, CASE, RAISE and call syntax errors" {
     try expectError("SELECT f(a,)", "near \")\": syntax error", .{ .byte_offset = 11, .line = 1, .column = 12 });
     try expectError("SELECT f(a ORDER b)", "near \"b\": syntax error", .{ .byte_offset = 17, .line = 1, .column = 18 });
     try expectError("SELECT f(a ORDER BY b NULLS)", "near \")\": syntax error", .{ .byte_offset = 27, .line = 1, .column = 28 });
-    try expectError("SELECT f(a) OVER (x)", "near \"OVER\": syntax error", .{ .byte_offset = 12, .line = 1, .column = 13 });
     try expectError("SELECT 'f'(1)", "near \"(\": syntax error", .{ .byte_offset = 10, .line = 1, .column = 11 });
 }
 

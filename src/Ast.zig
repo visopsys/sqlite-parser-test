@@ -1808,3 +1808,102 @@ test "WITH and window syntax errors" {
         try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
     }
 }
+
+test "INSERT" {
+    const cases = [_][2][:0]const u8{
+        .{ "insert into t values (1, 2)", "INSERT INTO t VALUES (1, 2);\n" },
+        .{ "INSERT INTO t VALUES (1), (2)", "INSERT INTO t VALUES (1), (2);\n" },
+        .{ "INSERT INTO t(a, b) SELECT 1, 2", "INSERT INTO t (a, b) SELECT 1, 2;\n" },
+        .{ "replace into t(a) values(1)", "REPLACE INTO t (a) VALUES (1);\n" },
+        .{ "INSERT OR REPLACE INTO main.t AS x (a, b) SELECT 1, 2", "INSERT OR REPLACE INTO main.t AS x (a, b) SELECT 1, 2;\n" },
+        .{ "INSERT OR ROLLBACK INTO t VALUES (1)", "INSERT OR ROLLBACK INTO t VALUES (1);\n" },
+        .{ "INSERT OR ABORT INTO t VALUES (1)", "INSERT OR ABORT INTO t VALUES (1);\n" },
+        .{ "INSERT OR FAIL INTO t VALUES (1)", "INSERT OR FAIL INTO t VALUES (1);\n" },
+        .{ "INSERT OR IGNORE INTO t VALUES (1)", "INSERT OR IGNORE INTO t VALUES (1);\n" },
+        .{ "INSERT INTO t AS x VALUES (1)", "INSERT INTO t AS x VALUES (1);\n" },
+        .{ "INSERT INTO 'my t' DEFAULT VALUES", "INSERT INTO \"my t\" DEFAULT VALUES;\n" },
+        .{ "INSERT INTO t DEFAULT VALUES", "INSERT INTO t DEFAULT VALUES;\n" },
+        .{ "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x", "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x;\n" },
+        .{ "with x(a) as (select 1) replace into t(a) select a from x", "WITH x(a) AS (SELECT 1) REPLACE INTO t (a) SELECT a FROM x;\n" },
+        .{ "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT DO NOTHING", "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT DO NOTHING;\n" },
+        .{ "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT(x) DO NOTHING", "INSERT INTO t SELECT 1 FROM a WHERE true ON CONFLICT (x) DO NOTHING;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "INSERT upsert chains and RETURNING" {
+    const cases = [_][2][:0]const u8{
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING", "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;\n" },
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1", "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1;\n" },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a COLLATE nocase DESC, b+1) WHERE a>1 DO UPDATE SET a=1+1, (b,c)=(1,2) WHERE b<3",
+            "INSERT INTO t VALUES (1) ON CONFLICT ((a COLLATE nocase) DESC, (b + 1)) WHERE (a > 1) DO UPDATE SET a = (1 + 1), (b, c) = (1, 2) WHERE (b < 3);\n",
+        },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a) DO NOTHING ON CONFLICT(b) DO UPDATE SET x=1 ON CONFLICT DO NOTHING",
+            "INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING ON CONFLICT (b) DO UPDATE SET x = 1 ON CONFLICT DO NOTHING;\n",
+        },
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT(a) DO UPDATE SET (a) = 1", "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET (a) = 1;\n" },
+        .{ "INSERT INTO t VALUES (1) RETURNING *", "INSERT INTO t VALUES (1) RETURNING *;\n" },
+        .{ "INSERT INTO t VALUES (1) RETURNING a, b+1 AS c", "INSERT INTO t VALUES (1) RETURNING a, (b + 1) AS c;\n" },
+        .{ "INSERT INTO t DEFAULT VALUES RETURNING a", "INSERT INTO t DEFAULT VALUES RETURNING a;\n" },
+        .{ "REPLACE INTO t VALUES (1) RETURNING *", "REPLACE INTO t VALUES (1) RETURNING *;\n" },
+        .{ "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING RETURNING a", "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING RETURNING a;\n" },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a) DO UPDATE SET a=1 RETURNING *",
+            "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1 RETURNING *;\n",
+        },
+        .{
+            "INSERT INTO t VALUES (1) ON CONFLICT(a) DO NOTHING RETURNING a, b AS c",
+            "INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING RETURNING a, b AS c;\n",
+        },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "INSERT errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const syntax = [_]Case{
+        // A join's ON swallows ON CONFLICT, so DO is the first bad token.
+        .{ "INSERT INTO t SELECT * FROM u ON CONFLICT DO NOTHING", "near \"DO\": syntax error", 42 },
+        .{ "INSERT INTO t SELECT * FROM a JOIN b ON CONFLICT DO NOTHING", "near \"DO\": syntax error", 49 },
+        .{ "INSERT INTO t SELECT * FROM a ON CONFLICT(x) DO NOTHING", "near \"DO\": syntax error", 45 },
+        .{ "INSERT INTO t SELECT * FROM a JOIN b ON CONFLICT(x) DO NOTHING", "near \"DO\": syntax error", 52 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT DO NOTHING ON CONFLICT(b) DO NOTHING", "near \"ON\": syntax error", 47 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT DO UPDATE SET a=1 ON CONFLICT DO NOTHING", "near \"ON\": syntax error", 54 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT(a) DO NOTHING RETURNING a ON CONFLICT(b) DO NOTHING", "near \"ON\": syntax error", 62 },
+        .{ "INSERT INTO t DEFAULT VALUES ON CONFLICT DO NOTHING", "near \"ON\": syntax error", 29 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT DO FOO", "near \"FOO\": syntax error", 39 },
+        .{ "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET (a,)=1", "near \")\": syntax error", 56 },
+        .{ "INSERT OR RAISE INTO t VALUES(1)", "near \"RAISE\": syntax error", 10 },
+        .{ "INSERT OR INTO t VALUES(1)", "near \"INTO\": syntax error", 10 },
+        .{ "INSERT INTO t() VALUES(1)", "near \")\": syntax error", 14 },
+        .{ "INSERT t VALUES(1)", "near \"t\": syntax error", 7 },
+    };
+    for (syntax) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+
+    const incomplete = [_][:0]const u8{
+        "INSERT",
+        "INSERT INTO",
+        "INSERT INTO t",
+        "INSERT INTO t(",
+        "INSERT INTO t(a,",
+        "INSERT INTO t VALUES",
+        "INSERT INTO t DEFAULT",
+        "INSERT INTO t DEFAULT VALUES RETURNING",
+        "INSERT INTO t VALUES(1) RETURNING",
+        "INSERT INTO t VALUES(1) ON",
+        "INSERT INTO t VALUES(1) ON CONFLICT",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a)",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET a",
+        "INSERT INTO t VALUES(1) ON CONFLICT(a) DO UPDATE SET a=",
+    };
+    for (incomplete) |source| {
+        try expectError(source, "incomplete input", .{ .byte_offset = source.len, .line = 1, .column = source.len + 1 });
+    }
+}

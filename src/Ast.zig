@@ -191,6 +191,35 @@ pub const Node = struct {
         };
     };
 
+    /// The record `Tag.create_index` points to in `extra_data`; absent tokens and nodes are 0.
+    pub const CreateIndex = extern struct {
+        flags: Flags,
+        schema: u32,
+        name: u32,
+        table: u32,
+        /// The `order_item` nodes.
+        items_start: u32,
+        items_end: u32,
+        /// The `WHERE` expression.
+        where: u32,
+
+        pub const Flags = packed struct(u32) {
+            unique: bool = false,
+            if_not_exists: bool = false,
+            _: u30 = 0,
+        };
+    };
+
+    /// The record `Tag.drop` points to in `extra_data`; absent tokens are 0.
+    pub const Drop = extern struct {
+        kind: Kind,
+        if_exists: bool,
+        schema: u32,
+        name: u32,
+
+        pub const Kind = enum(u32) { table, view, index, trigger };
+    };
+
     /// The record `Tag.alter_table` points to in `extra_data`; absent tokens are 0.
     pub const AlterTable = extern struct {
         action: Action,
@@ -409,6 +438,12 @@ pub const Node = struct {
         /// `ALTER TABLE [schema.]name action`. `main_token` is `ALTER`. `lhs` is the
         /// `extra_data` index of a `Node.AlterTable`.
         alter_table,
+        /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON table (..) [WHERE ..]`.
+        /// `main_token` is `CREATE`. `lhs` is the `extra_data` index of a `Node.CreateIndex`.
+        create_index,
+        /// `DROP TABLE|VIEW|INDEX|TRIGGER [IF EXISTS] [schema.]name`. `main_token` is `DROP`.
+        /// `lhs` is the `extra_data` index of a `Node.Drop`.
+        drop,
         /// `name [type] constraints..`. `main_token` is the name. `lhs` is the `extra_data`
         /// index of the first and the end token of the type (equal when there is none), the
         /// constraint count and the constraint nodes.
@@ -674,6 +709,8 @@ fn renderStatement(self: Ast, node: Node.Index, writer: *std.Io.Writer) std.Io.W
         },
         .create_table => try self.renderCreateTable(n, writer),
         .alter_table => try self.renderAlterTable(n, writer),
+        .create_index => try self.renderCreateIndex(n, writer),
+        .drop => try self.renderDrop(n, writer),
         .insert => try self.renderInsert(n, writer),
         .update => try self.renderUpdate(n, writer),
         .delete => try self.renderDelete(n, writer),
@@ -759,6 +796,43 @@ fn renderCreateTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.E
     try writer.writeByte(')');
     if (t.flags.without_rowid) try writer.writeAll(" WITHOUT ROWID");
     if (t.flags.strict) try writer.writeAll(if (t.flags.without_rowid) ", STRICT" else " STRICT");
+}
+
+fn renderCreateIndex(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.CreateIndex = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.CreateIndex) / 4]);
+    try writer.writeAll(if (t.flags.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+    if (t.flags.if_not_exists) try writer.writeAll("IF NOT EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
+    try writer.writeAll(" ON ");
+    try self.renderName(t.table, writer);
+    try writer.writeAll(" (");
+    try self.renderExprRange(t.items_start, t.items_end, writer);
+    try writer.writeByte(')');
+    if (t.where != 0) {
+        try writer.writeAll(" WHERE (");
+        try self.renderExpr(@fromBackingInt(@intCast(t.where)), writer);
+        try writer.writeByte(')');
+    }
+}
+
+fn renderDrop(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const t: *const Node.Drop = @ptrCast(self.extra_data[n.data.lhs..][0 .. @sizeOf(Node.Drop) / 4]);
+    try writer.writeAll(switch (t.kind) {
+        .table => "DROP TABLE ",
+        .view => "DROP VIEW ",
+        .index => "DROP INDEX ",
+        .trigger => "DROP TRIGGER ",
+    });
+    if (t.if_exists) try writer.writeAll("IF EXISTS ");
+    if (t.schema != 0) {
+        try self.renderName(t.schema, writer);
+        try writer.writeByte('.');
+    }
+    try self.renderName(t.name, writer);
 }
 
 fn renderAlterTable(self: Ast, n: Node, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2462,6 +2536,67 @@ test "ALTER TABLE" {
         .{ "alter table main.t add b int not null default 0 references p(x)", "ALTER TABLE main.t ADD COLUMN b int NOT NULL DEFAULT 0 REFERENCES p (x);\n" },
     };
     for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE INDEX" {
+    const cases = [_][2][:0]const u8{
+        .{ "create index i on t(a)", "CREATE INDEX i ON t (a);\n" },
+        .{ "create unique index if not exists m.i on 't'(a asc, b desc nulls first, c nulls last)", "CREATE UNIQUE INDEX IF NOT EXISTS m.i ON t (a ASC, b DESC NULLS FIRST, c NULLS LAST);\n" },
+        .{ "create index i on t(a+1, abs(b) collate nocase) where a > 1 and b", "CREATE INDEX i ON t ((a + 1), (abs(b) COLLATE nocase)) WHERE (((a > 1) AND b));\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "CREATE INDEX errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "CREATE INDEX", "incomplete input", 12 },
+        .{ "CREATE UNIQUE", "incomplete input", 13 },
+        .{ "CREATE TEMP", "incomplete input", 11 },
+        .{ "CREATE INDEX i", "incomplete input", 14 },
+        .{ "CREATE INDEX i ON", "incomplete input", 17 },
+        .{ "CREATE INDEX i ON t", "incomplete input", 19 },
+        .{ "CREATE INDEX i ON t(", "incomplete input", 20 },
+        .{ "CREATE INDEX i ON t()", "near \")\": syntax error", 20 },
+        .{ "CREATE INDEX i ON t(a) WHERE", "incomplete input", 28 },
+        .{ "CREATE INDEX i ON t(a) WHERE 1 2", "near \"2\": syntax error", 31 },
+        .{ "CREATE INDEX i t(a)", "near \"t\": syntax error", 15 },
+        .{ "CREATE INDEX IF i ON t(a)", "near \"i\": syntax error", 16 },
+        .{ "CREATE TEMP INDEX i ON t(a)", "near \"INDEX\": syntax error", 12 },
+        .{ "CREATE UNIQUE TABLE t(a)", "near \"TABLE\": syntax error", 14 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+    try expectError("CREATE INDEX i\n  ON t(\n  a,)", "near \")\": syntax error", .{ .byte_offset = 27, .line = 3, .column = 5 });
+}
+
+test "DROP" {
+    const cases = [_][2][:0]const u8{
+        .{ "drop table t", "DROP TABLE t;\n" },
+        .{ "drop view if exists m.'v'", "DROP VIEW IF EXISTS m.v;\n" },
+        .{ "DROP INDEX main.i", "DROP INDEX main.i;\n" },
+        .{ "drop trigger if exists tr", "DROP TRIGGER IF EXISTS tr;\n" },
+    };
+    for (cases) |case| try expectRender(case[0], case[1]);
+}
+
+test "DROP errors" {
+    const Case = struct { [:0]const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "DROP", "incomplete input", 4 },
+        .{ "DROP TABLE", "incomplete input", 10 },
+        .{ "DROP TABLE IF", "incomplete input", 13 },
+        .{ "DROP TABLE IF t", "near \"t\": syntax error", 14 },
+        .{ "DROP TABLE t.", "incomplete input", 13 },
+        .{ "DROP TABLE t.u.v", "near \".\": syntax error", 14 },
+        .{ "DROP FOO", "near \"FOO\": syntax error", 5 },
+        .{ "DROP TABLE select", "near \"select\": syntax error", 11 },
+    };
+    for (cases) |case| {
+        try expectError(case[0], case[1], .{ .byte_offset = case[2], .line = 1, .column = case[2] + 1 });
+    }
+    try expectError("DROP\nTABLE\n  IF x", "near \"x\": syntax error", .{ .byte_offset = 16, .line = 3, .column = 6 });
 }
 
 test "ALTER TABLE errors" {

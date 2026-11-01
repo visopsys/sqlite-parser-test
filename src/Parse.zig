@@ -93,6 +93,7 @@ fn parseStatement(p: *Parse) Error!Node.Index {
         .keyword_update => return p.parseUpdate(),
         .keyword_delete => return p.parseDelete(),
         .keyword_create => return p.parseCreate(),
+        .keyword_drop => return p.parseDrop(),
         .keyword_alter => return p.parseAlterTable(),
         .keyword_pragma => return p.parsePragma(),
         .keyword_attach => return p.parseAttach(),
@@ -503,16 +504,18 @@ fn parseWholeExpr(p: *Parse) Error!Node.Index {
     return p.parseExpr(0);
 }
 
-/// `cmd ::= create_table create_table_args`; only the TABLE form is recognized so far, and
-/// the other statements CREATE can start are rejected at the token after
-/// `CREATE [TEMP | UNIQUE]`.
+/// `cmd ::= create_table create_table_args | createkw uniqueflag INDEX ..`; the other
+/// statements CREATE can start are rejected at the token after `CREATE [TEMP | UNIQUE]`.
 fn parseCreate(p: *Parse) Error!Node.Index {
     const create = p.nextToken();
     const temp = p.eat(.keyword_temp);
-    if (!p.eat(.keyword_table)) {
-        if (!temp) _ = p.eat(.keyword_unique);
-        return p.failHere();
-    }
+    const unique = !temp and p.eat(.keyword_unique);
+    if (p.peek() == .keyword_index and !temp) return p.parseCreateIndex(create, unique);
+    if (unique or !p.eat(.keyword_table)) return p.failHere();
+    return p.parseCreateTable(create, temp);
+}
+
+fn parseCreateTable(p: *Parse, create: TokenIndex, temp: bool) Error!Node.Index {
     var record: Node.CreateTable = std.mem.zeroes(Node.CreateTable);
     record.flags.temp = temp;
     if (p.eat(.keyword_if)) {
@@ -537,6 +540,63 @@ fn parseCreate(p: *Parse) Error!Node.Index {
         .tag = .create_table,
         .main_token = create,
         .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = query },
+    });
+}
+
+/// `INDEX ifnotexists nm dbnm ON nm LP sortlist RP where_opt`, after `CREATE [UNIQUE]`.
+fn parseCreateIndex(p: *Parse, create: TokenIndex, unique: bool) Error!Node.Index {
+    _ = p.nextToken();
+    var record: Node.CreateIndex = std.mem.zeroes(Node.CreateIndex);
+    record.flags.unique = unique;
+    if (p.eat(.keyword_if)) {
+        if (!p.eat(.keyword_not) or !p.eat(.keyword_exists)) return p.failHere();
+        record.flags.if_not_exists = true;
+    }
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    if (!p.eat(.keyword_on)) return p.failHere();
+    record.table = try p.parseName(.nm);
+    if (!p.eat(.l_paren)) return p.failHere();
+    const items = try p.parseCommaList(parseOrderItem);
+    record.items_start = items.lhs;
+    record.items_end = items.rhs;
+    if (!p.eat(.r_paren)) return p.failHere();
+    if (p.eat(.keyword_where)) record.where = @backingInt(try p.parseExpr(0));
+    return p.addNode(.{
+        .tag = .create_index,
+        .main_token = create,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
+    });
+}
+
+/// `cmd ::= DROP TABLE|VIEW|INDEX|TRIGGER ifexists fullname`.
+fn parseDrop(p: *Parse) Error!Node.Index {
+    const drop = p.nextToken();
+    var record: Node.Drop = std.mem.zeroes(Node.Drop);
+    record.kind = switch (p.peek()) {
+        .keyword_table => .table,
+        .keyword_view => .view,
+        .keyword_index => .index,
+        .keyword_trigger => .trigger,
+        else => return p.failHere(),
+    };
+    _ = p.nextToken();
+    if (p.eat(.keyword_if)) {
+        if (!p.eat(.keyword_exists)) return p.failHere();
+        record.if_exists = true;
+    }
+    record.name = try p.parseName(.nm);
+    if (p.eat(.dot)) {
+        record.schema = record.name;
+        record.name = try p.parseName(.nm);
+    }
+    return p.addNode(.{
+        .tag = .drop,
+        .main_token = drop,
+        .data = .{ .lhs = try p.addExtra(@ptrCast(&record)), .rhs = 0 },
     });
 }
 
